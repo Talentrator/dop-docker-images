@@ -11,6 +11,29 @@ Zephyr **v4.4.2** (latest stable) + Zephyr SDK **1.0.1** for:
 
 Builds for `linux/arm64` (Apple Silicon, ARM servers) and `linux/amd64`. Tested so far on arm64 only.
 
+## Prebuilt image (GitHub Container Registry)
+
+GitHub Actions ([`.github/workflows/docker-image.yml`](.github/workflows/docker-image.yml)) builds the image for
+`linux/amd64` and `linux/arm64` on every push to `main` that touches the Dockerfile or scripts (or manually via
+*Run workflow*), runs the smoke test on both architectures, and only then publishes it:
+
+```bash
+docker pull ghcr.io/talentrator/zephyr_env_dop:latest
+```
+
+| Tag | Meaning |
+|-----|---------|
+| `latest` | Newest build from `main` |
+| `zephyr-v4.4.2` | Newest build for that Zephyr release |
+| `sha-<commit>` | Build of one exact commit |
+| `1.2.3` | Git tag `v1.2.3` |
+
+The published image is built with `INSTALL_JLINK=false` (SEGGER's license does not allow redistributing J-Link).
+Build locally with the default `INSTALL_JLINK=true` if you need J-Link.
+
+**For DOP (or any system that must be reproducible)** use the pinned digest printed in the workflow run summary,
+not a tag: `ghcr.io/talentrator/zephyr_env_dop@sha256:<digest>`.
+
 ## Build
 
 ```bash
