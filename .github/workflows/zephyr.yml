@@ -1,0 +1,36 @@
+# The zephyr image: zephyr/ in this repo, published as ghcr.io/<owner>/<repo>/zephyr.
+name: zephyr
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - zephyr/**
+      - .github/workflows/zephyr.yml
+      - .github/workflows/image.yml
+  pull_request:
+    paths:
+      - zephyr/**
+      - .github/workflows/zephyr.yml
+      - .github/workflows/image.yml
+  workflow_dispatch:
+
+concurrency:
+  group: zephyr-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  image:
+    uses: ./.github/workflows/image.yml
+    with:
+      image: zephyr
+      version_arg: ZEPHYR_VERSION
+      smoke_test: zephyr-smoke-test
+      description: Zephyr + SDK for QEMU, nRF, STM32, ESP32
+      # J-Link stays out of the public image: SEGGER's license does not allow redistribution
+      build_args: |
+        INSTALL_JLINK=false
