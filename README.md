@@ -8,6 +8,7 @@ published to GHCR as `ghcr.io/talentrator/dop-docker-images/<folder>`.
 |-------|------------|----------|
 | [`zephyr`](zephyr) | Zephyr v4.4.2 + SDK 1.0.1 for QEMU, Nordic nRF, STM32 and ESP32, with the flashing tools | ~10 GB |
 | [`zephyr-qemu`](zephyr-qemu) | Zephyr v4.4.2 + SDK 1.0.1 for QEMU boards only; fits a 10 GB Daytona sandbox | ~5.2 GB |
+| [`zephyr-qemu-arm`](zephyr-qemu-arm) | Zephyr v4.4.2 + SDK 1.0.1 for the Arm QEMU boards only (`qemu_cortex_m3`, `_r5`, `_a9`) | ~2.3 GB |
 
 For DOP, always use the pinned digest a workflow run prints in its summary, not a tag:
 `ghcr.io/talentrator/dop-docker-images/<image>@sha256:<digest>`.
