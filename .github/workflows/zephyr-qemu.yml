@@ -1,0 +1,33 @@
+# The zephyr-qemu image: zephyr-qemu/ in this repo, published as ghcr.io/<owner>/<repo>/zephyr-qemu.
+name: zephyr-qemu
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - zephyr-qemu/**
+      - .github/workflows/zephyr-qemu.yml
+      - .github/workflows/image.yml
+  pull_request:
+    paths:
+      - zephyr-qemu/**
+      - .github/workflows/zephyr-qemu.yml
+      - .github/workflows/image.yml
+  workflow_dispatch:
+
+concurrency:
+  group: zephyr-qemu-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  image:
+    uses: ./.github/workflows/image.yml
+    with:
+      image: zephyr-qemu
+      version_arg: ZEPHYR_VERSION
+      smoke_test: zephyr-smoke-test
+      description: Zephyr + SDK for QEMU boards only
