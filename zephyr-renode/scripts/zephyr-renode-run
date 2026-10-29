@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+# Runs a Zephyr image on its board in Renode, headless, for a span of virtual
+# time, and prints what the board wrote on its console UART. Virtual time is
+# Renode's, not the host's: the same image prints the same bytes every run.
+#
+# Usage: zephyr-renode-run [-t seconds] [-b board] [-e command]... [--resc] <build-dir | zephyr.elf>
+#   -t  virtual seconds to run (default 5)
+#   -b  the Zephyr board; read from the build directory when not given
+#   -e  a Renode Monitor command to run after the board is loaded and before
+#       it starts (repeatable), for example to set a sensor's value
+#   --resc  print the Renode script instead of running it
+set -euo pipefail
+
+secs=5 board= resc= extra=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -t) secs=$2; shift 2 ;;
+    -b) board=$2; shift 2 ;;
+    -e) extra+=("$2"); shift 2 ;;
+    --resc) resc=1; shift ;;
+    -h|--help) sed -n '2,13p' "$0"; exit 0 ;;
+    *) break ;;
+  esac
+done
+[ $# -eq 1 ] || { sed -n '6,6p' "$0" >&2; exit 2; }
+
+target=$1
+if [ -d "$target" ]; then
+  elf=$target/zephyr/zephyr.elf
+  [ -n "$board" ] || board=$(sed -n 's/^BOARD:[A-Z]*=//p' "$target/CMakeCache.txt" 2>/dev/null | head -n1)
+else
+  elf=$target
+fi
+[ -f "$elf" ] || { echo "no image at $elf" >&2; exit 2; }
+elf=$(readlink -f "$elf")
+
+# The Zephyr board, the Renode platform it runs on and its console UART
+case "${board%%/*}" in
+  stm32f4_disco)     repl=@platforms/boards/stm32f4_discovery.repl  uart=usart2 ;;
+  nucleo_f767zi)     repl=@platforms/boards/nucleo_f767zi.repl      uart=usart3 ;;
+  stm32f072b_disco)  repl=@platforms/boards/stm32f072b_discovery.repl uart=usart1 ;;
+  nrf52840dk)        repl=@platforms/boards/nrf52840dk_nrf52840.repl uart=uart0 ;;
+  cortex_r8_virtual) repl=@$ZEPHYR_BASE/boards/renode/cortex_r8_virtual/support/cortex_r8_virtual.repl uart=uart0 ;;
+  *) echo "no Renode platform for board '${board:-?}' (pass -b)" >&2; exit 2 ;;
+esac
+
+out=$(mktemp)
+script=$(mktemp --suffix=.resc)
+trap 'rm -f "$out" "$script"' EXIT
+{
+  echo 'mach create "board"'
+  echo "machine LoadPlatformDescription $repl"
+  echo "sysbus LoadELF @$elf"
+  echo "sysbus.$uart CreateFileBackend @$out true"
+  for c in "${extra[@]}"; do echo "$c"; done
+  echo "emulation RunFor \"$secs\""
+  echo 'quit'
+} >"$script"
+
+if [ -n "$resc" ]; then
+  sed "s|@$out|@/tmp/uart.txt|" "$script"
+  exit 0
+fi
+
+# -P -1: no Monitor port, so runs side by side do not collide on 1234
+if ! renode --disable-gui --plain -P -1 "$script" >"$out.log" 2>&1; then
+  tail -n 20 "$out.log" >&2; rm -f "$out.log"; exit 1
+fi
+rm -f "$out.log"
+cat "$out"
