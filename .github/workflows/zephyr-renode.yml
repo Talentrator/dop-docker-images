@@ -1,0 +1,33 @@
+# The zephyr-renode image: zephyr-renode/ in this repo, published as ghcr.io/<owner>/<repo>/zephyr-renode.
+name: zephyr-renode
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - zephyr-renode/**
+      - .github/workflows/zephyr-renode.yml
+      - .github/workflows/image.yml
+  pull_request:
+    paths:
+      - zephyr-renode/**
+      - .github/workflows/zephyr-renode.yml
+      - .github/workflows/image.yml
+  workflow_dispatch:
+
+concurrency:
+  group: zephyr-renode-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  image:
+    uses: ./.github/workflows/image.yml
+    with:
+      image: zephyr-renode
+      version_arg: ZEPHYR_VERSION
+      smoke_test: zephyr-smoke-test
+      description: Zephyr + SDK + Renode for the STM32, nRF52 and Cortex-R8 boards Renode runs
