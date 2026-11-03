@@ -1,0 +1,497 @@
+#!/usr/bin/env python3
+"""zr-scenario: build a Zephyr project the way the grader does and run it on Renode against scenarios.
+
+The same program runs in the model's box and in the grader, so a model's own test matches grading.
+
+  zr-scenario run   [--project DIR] [--task DIR] [SCENARIO.json ...]
+      Box use. Builds the project with the task's rules and runs the given scenarios (default: the
+      task's visible scenarios), then prints every check and the score it would get.
+
+  zr-scenario grade --project DIR --task DIR --scenarios DIR [--out /out/reward.json]
+      Grader use, as root. Builds as the unprivileged user `zbuild`, which must not be able to read
+      the scenarios; ends every zbuild process before Renode starts; writes DOP's reward.json.
+
+What crosses from the project into the build (the copy-in rule): src/ (every file under it),
+prj.conf and app.overlay. Nothing else: the build uses the task's CMakeLists.txt, and the task's
+locked overlay and Kconfig fragment are applied after the project's own.
+
+A task directory holds zr-task.json, CMakeLists.txt, locked.overlay, locked.conf and a scenarios/
+folder (the visible ones). A scenario is one JSON file: sensor traces (CSV in g, at a fixed rate)
+and checks read from the simulated hardware (CAN frames on the hub, with simulated-time stamps).
+Each check belongs to a group; a group scores the share of its checks that pass, the reward is
+the lowest group score, and a strict pass needs every check. No build scores 0.
+"""
+from __future__ import annotations
+
+import argparse
+import concurrent.futures as cf
+import csv
+import json
+import os
+import pwd
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+
+COPY_IN_FILES = ("prj.conf", "app.overlay")
+COPY_IN_DIRS = ("src",)
+BUILD_USER = "zbuild"
+RENODE_TIMEOUT_S = 240
+CSV2RESD = "/opt/renode/tools/csv2resd/csv2resd.py"
+G = 9.80665
+
+
+class HarnessError(Exception):
+    """Something wrong with the runner, the task or Renode, never with the model's firmware."""
+
+
+# --------------------------------------------------------------------------- task and project
+
+def load_task(task_dir: str) -> dict:
+    path = os.path.join(task_dir, "zr-task.json")
+    if not os.path.isfile(path):
+        raise HarnessError(f"no zr-task.json in {task_dir}")
+    with open(path) as f:
+        task = json.load(f)
+    task["dir"] = os.path.realpath(task_dir)
+    for key in ("board", "platform", "console"):
+        if key not in task:
+            raise HarnessError(f"zr-task.json has no {key!r}")
+    return task
+
+
+def stage(project: str, task: dict, dest: str) -> list[str]:
+    """Copy the files that count into a fresh app folder with the task's CMakeLists.txt.
+
+    Returns what was copied, for the log. Symlinks are not followed: a link to a file outside the
+    project would otherwise carry that file into the build.
+    """
+    os.makedirs(dest)
+    copied = []
+    for name in COPY_IN_FILES:
+        src = os.path.join(project, name)
+        if os.path.isfile(src) and not os.path.islink(src):
+            shutil.copyfile(src, os.path.join(dest, name))
+            copied.append(name)
+    for d in COPY_IN_DIRS:
+        top = os.path.join(project, d)
+        if not os.path.isdir(top) or os.path.islink(top):
+            continue
+        for root, dirs, files in os.walk(top):
+            dirs[:] = [x for x in dirs if not os.path.islink(os.path.join(root, x))]
+            for n in files:
+                p = os.path.join(root, n)
+                if os.path.islink(p) or not os.path.isfile(p):
+                    continue
+                rel = os.path.relpath(p, project)
+                os.makedirs(os.path.dirname(os.path.join(dest, rel)), exist_ok=True)
+                shutil.copyfile(p, os.path.join(dest, rel))
+                copied.append(rel)
+    if "prj.conf" not in copied:
+        open(os.path.join(dest, "prj.conf"), "w").close()
+    shutil.copyfile(os.path.join(task["dir"], "CMakeLists.txt"), os.path.join(dest, "CMakeLists.txt"))
+    return copied
+
+
+# --------------------------------------------------------------------------- build
+
+def _as_build_user(argv: list[str], env: dict) -> list[str]:
+    return ["runuser", "-u", BUILD_USER, "--", "env", "-i", *[f"{k}={v}" for k, v in env.items()], *argv]
+
+
+def _end_user_processes(user: str) -> None:
+    """Kill every process of `user` and wait until none is left."""
+    for _ in range(50):
+        subprocess.run(["pkill", "-KILL", "-u", user], capture_output=True)
+        if subprocess.run(["pgrep", "-u", user], capture_output=True).returncode != 0:
+            return
+        time.sleep(0.1)
+    raise HarnessError(f"processes of {user} still running after the build")
+
+
+def build(app: str, out: str, task: dict, drop_privileges: bool) -> dict:
+    """west build of the staged app. Returns {ok, elf, seconds, log}."""
+    build_dir = os.path.join(out, "build")
+    # The locked overlay goes before the project's app.overlay, so the project can refer to the
+    # nodes it defines, and again after it, so the project cannot change what it sets.
+    locked = os.path.join(task["dir"], "locked.overlay")
+    overlays = [locked] + ([os.path.join(app, "app.overlay")] if os.path.isfile(os.path.join(app, "app.overlay")) else [])
+    argv = ["west", "build", "-p", "always", "-b", task["board"], "-d", build_dir, app, "--",
+            f"-DDTC_OVERLAY_FILE={';'.join(overlays)}",
+            f"-DEXTRA_DTC_OVERLAY_FILE={locked}",
+            f"-DEXTRA_CONF_FILE={os.path.join(task['dir'], 'locked.conf')}",
+            "-DUSE_CCACHE=0"]
+    keep = ("PATH", "ZEPHYR_BASE", "ZEPHYR_SDK_INSTALL_DIR", "ZEPHYR_TOOLCHAIN_VARIANT", "VIRTUAL_ENV",
+            "LANG", "LC_ALL")
+    env = {k: os.environ[k] for k in keep if k in os.environ}
+    t = time.monotonic()
+    if drop_privileges:
+        home = os.path.join(out, "home")
+        # Zephyr keeps its toolchain cache in $HOME/.cache when that exists and is writable,
+        # else under ZEPHYR_BASE, which the build user cannot write
+        os.makedirs(os.path.join(home, ".cache"))
+        uid = pwd.getpwnam(BUILD_USER).pw_uid
+        for root, dirs, files in os.walk(out):
+            for n in dirs + files:
+                os.chown(os.path.join(root, n), uid, -1, follow_symlinks=False)
+        os.chown(out, uid, -1)
+        env["HOME"] = home
+        r = subprocess.run(_as_build_user(argv, env), capture_output=True, text=True, errors="replace")
+        _end_user_processes(BUILD_USER)
+    else:
+        env["HOME"] = os.environ.get("HOME", "/tmp")
+        r = subprocess.run(argv, capture_output=True, text=True, errors="replace", env=env)
+    seconds = time.monotonic() - t
+    log = (r.stdout or "") + (r.stderr or "")
+    elf = os.path.join(build_dir, "zephyr", "zephyr.elf")
+    if r.returncode != 0 or not os.path.isfile(elf):
+        return {"ok": False, "seconds": seconds, "log": log}
+    # the image Renode runs is a copy the build user never owned
+    safe = os.path.join(out, "zephyr.elf")
+    shutil.copyfile(elf, safe)
+    os.chown(safe, os.getuid(), os.getgid())
+    os.chmod(safe, 0o444)
+    return {"ok": True, "elf": safe, "seconds": seconds, "log": log}
+
+
+# --------------------------------------------------------------------------- scenario run
+
+def _resd(trace_csv: str, rate_hz: float, start_s: float, out: str) -> None:
+    """A CSV of x,y,z in g at rate_hz into a RESD file whose first sample is at start_s."""
+    tmp = out + ".ug.csv"
+    with open(trace_csv) as f, open(tmp, "w") as g:
+        rows = csv.DictReader(f)
+        g.write("x,y,z\n")
+        n = 0
+        for row in rows:
+            g.write(",".join(str(int(round(float(row[a]) * 1e6))) for a in ("x", "y", "z")) + "\n")
+            n += 1
+    if n == 0:
+        raise HarnessError(f"{trace_csv}: no samples")
+    r = subprocess.run([sys.executable, CSV2RESD, "--input", tmp, "--map", "acceleration:x,y,z:x,y,z",
+                        "--start-time", str(int(round(start_s * 1e9))), "--frequency", str(rate_hz), out],
+                       capture_output=True, text=True)
+    if r.returncode != 0 or not os.path.isfile(out):
+        raise HarnessError(f"csv2resd failed for {trace_csv}: {r.stdout}{r.stderr}")
+
+
+def _script(task: dict, scen: dict, scen_dir: str, elf: str, work: str) -> str:
+    lines = [f"include @{p}" for p in task.get("includes", [])]
+    lines += [
+        f"emulation SetSeed {int(task.get('seed', 1))}",
+        "emulation SetAdvanceImmediately true",
+        'mach create "board"',
+        f"machine LoadPlatformDescription @{task['platform']}",
+    ]
+    for s in task.get("sensors", []):
+        lines.append(f'machine LoadPlatformDescriptionFromString "{s["name"]}: {s["decl"]}"')
+    lines.append(f"sysbus LoadELF @{elf}")
+    lines.append(f"sysbus.{task['console']} CreateFileBackend @{work}/uart.txt true")
+    for i, c in enumerate(task.get("can", [])):
+        hub = f"canHub{i}"
+        lines += [f'emulation CreateCANHub "{hub}"', f"connector Connect {c} {hub}",
+                  f'emulation CreateCANRecorder "canRec{i}" "{hub}" @{work}/can{i}.txt']
+    # sensor traces start feeding at feed_at_s, after the drivers have set an output rate
+    feeds = []
+    for name, spec in (scen.get("sensors") or {}).items():
+        sensor = next((s for s in task.get("sensors", []) if s["name"] == name), None)
+        if sensor is None:
+            raise HarnessError(f"scenario {scen['name']}: no sensor {name!r} in zr-task.json")
+        resd = os.path.join(work, f"{name}.resd")
+        _resd(os.path.join(scen_dir, spec["trace"]), spec["rate_hz"], spec["start_s"], resd)
+        feeds.append(f"{sensor['path']} {sensor['feed']} @{resd}")
+    feed_at = float(task.get("feed_at_s", 0.1))
+    duration = float(scen["duration_s"])
+    if feeds:
+        lines.append(f'emulation RunFor "{feed_at}"')
+        lines.append('echo "ZR-FEED"')
+        lines += feeds
+        lines.append(f'emulation RunFor "{duration - feed_at:.6f}"')
+    else:
+        lines.append(f'emulation RunFor "{duration}"')
+    lines += ['echo "ZR-END"', "sysbus.cpu ExecutedInstructions", "quit"]
+    return "\n".join(lines) + "\n"
+
+
+def run_scenario(task: dict, scen_path: str, elf: str, work: str) -> dict:
+    with open(scen_path) as f:
+        scen = json.load(f)
+    scen.setdefault("name", os.path.splitext(os.path.basename(scen_path))[0])
+    os.makedirs(work, exist_ok=True)
+    resc = os.path.join(work, "run.resc")
+    with open(resc, "w") as f:
+        f.write(_script(task, scen, os.path.dirname(scen_path), elf, work))
+    t = time.monotonic()
+    try:
+        r = subprocess.run(["renode", "--disable-gui", "--console", "--plain", "-P", "-1", resc],
+                           stdin=subprocess.DEVNULL, capture_output=True, text=True, errors="replace",
+                           timeout=RENODE_TIMEOUT_S)
+        log, timed_out = r.stdout + r.stderr, False
+    except subprocess.TimeoutExpired as e:
+        log = (e.stdout or b"").decode(errors="replace") if isinstance(e.stdout, bytes) else (e.stdout or "")
+        timed_out = True
+    wall = time.monotonic() - t
+    with open(os.path.join(work, "renode.log"), "w") as f:
+        f.write(log)
+    res = {"scenario": scen, "wall_s": round(wall, 2), "timed_out": timed_out, "notes": []}
+    if "error CS" in log:
+        raise HarnessError(f"a C# include failed to compile: {_first(log, 'error CS')}")
+    errors = re.findall(r"There was an error executing command '([^']*)':\s*\n([^\n]*)", log)
+    for cmd, why in errors:
+        if "Frequency must be higher than zero" in why:
+            # the firmware had not started the sensor by feed_at_s: the firmware's doing, not ours
+            res["notes"].append(f"sensor not started by {task.get('feed_at_s', 0.1)} s, so its trace never played")
+            res["sensor_not_started"] = True
+        else:
+            raise HarnessError(f"Renode refused {cmd!r}: {why}")
+    if not timed_out and "ZR-END" not in log:
+        raise HarnessError(f"Renode stopped before the end of {scen['name']}: {log[-1500:]}")
+    if timed_out:
+        res["notes"].append(f"simulation did not finish within {RENODE_TIMEOUT_S} s of wall time")
+    m = re.search(r"ExecutedInstructions\s*\n\s*(0x[0-9A-Fa-f]+)", log)
+    res["instructions"] = int(m.group(1), 16) if m else None
+    res["frames"] = []
+    for i, _ in enumerate(task.get("can", [])):
+        p = os.path.join(work, f"can{i}.txt")
+        if os.path.isfile(p):
+            for line in open(p):
+                ns, who, fid, ext, rtr, dlc, data = line.split()
+                res["frames"].append({"t": int(ns) / 1e9, "bus": i, "from": who, "id": int(fid, 16),
+                                      "ext": ext == "1", "rtr": rtr == "1",
+                                      "data": bytes.fromhex(data) if data != "-" else b""})
+    uart = os.path.join(work, "uart.txt")
+    res["uart"] = open(uart, errors="replace").read() if os.path.isfile(uart) else ""
+    return res
+
+
+def _first(text: str, needle: str) -> str:
+    return next((l for l in text.splitlines() if needle in l), "")
+
+
+# --------------------------------------------------------------------------- checks
+
+def _frames(res: dict, c: dict) -> list[dict]:
+    fid = int(str(c["id"]), 0)
+    lo, hi = float(c.get("from_s", 0.0)), float(c.get("to_s", 1e9))
+    return [f for f in res["frames"] if f["id"] == fid and f["ext"] == bool(c.get("ext", False))
+            and lo <= f["t"] < hi and f["from"] != "external"]
+
+
+def check(c: dict, res: dict) -> tuple[bool, str]:
+    kind = c["type"]
+    fr = _frames(res, c)
+    if kind == "can_frame":
+        n = len(fr)
+        if "count" in c:
+            return n == c["count"], f"{n} frame(s), expected {c['count']}"
+        return n >= c.get("min_count", 1), f"{n} frame(s), expected at least {c.get('min_count', 1)}"
+    if kind == "no_can_frame":
+        return not fr, ("none" if not fr else f"{len(fr)} frame(s), first at {fr[0]['t']:.4f} s")
+    if kind == "can_deadline":
+        t0 = float(c["t0_s"])
+        early = float(c.get("early_ms", 0)) / 1e3
+        late = float(c["within_ms"]) / 1e3
+        hit = [f for f in fr if f["t"] >= t0 - early]
+        if not hit:
+            return False, "no frame"
+        dt = (hit[0]["t"] - t0) * 1e3
+        return hit[0]["t"] <= t0 + late, f"first frame {dt:+.2f} ms from t0 (allowed -{early*1e3:g} to +{late*1e3:g})"
+    if kind == "can_data":
+        if not fr:
+            return False, "no frame"
+        d = fr[0]["data"]
+        if "dlc" in c and len(d) != c["dlc"]:
+            return False, f"dlc {len(d)}, expected {c['dlc']}"
+        b = c.get("byte")
+        if b is not None:
+            if b >= len(d):
+                return False, f"no byte {b} (dlc {len(d)})"
+            want = int(str(c["equals"]), 0)
+            return d[b] == want, f"byte {b} = 0x{d[b]:02x}, expected 0x{want:02x}"
+        return True, f"dlc {len(d)}"
+    if kind == "can_period":
+        period, tol = float(c["period_ms"]) / 1e3, float(c["tol_ms"]) / 1e3
+        lo, hi = float(c.get("from_s", 0.0)), float(c.get("to_s", res["scenario"]["duration_s"]))
+        need = int((hi - lo) / period) - 1
+        if len(fr) < need:
+            return False, f"{len(fr)} frame(s) in {hi - lo:.2f} s, expected at least {need}"
+        gaps = [b["t"] - a["t"] for a, b in zip(fr, fr[1:])]
+        worst = max((abs(g - period) for g in gaps), default=0.0)
+        return worst <= tol, f"{len(fr)} frames, worst gap off by {worst*1e3:.2f} ms (tolerance {tol*1e3:g})"
+    raise HarnessError(f"unknown check type {kind!r}")
+
+
+def score(results: list[dict]) -> dict:
+    rows = []
+    for res in results:
+        scen = res["scenario"]
+        for c in scen["checks"]:
+            name = f"{scen['name']}.{c['name']}"
+            group = c.get("group", scen.get("group", "main"))
+            if res.get("build_failed"):
+                ok, why = False, "no build"
+            else:
+                ok, why = check(c, res)
+                if res.get("timed_out"):
+                    ok, why = False, "simulation timed out"
+            rows.append({"name": name, "group": group, "passed": bool(ok), "detail": why})
+    groups: dict[str, list[bool]] = {}
+    for r in rows:
+        groups.setdefault(r["group"], []).append(r["passed"])
+    group_scores = {g: sum(v) / len(v) for g, v in groups.items()}
+    reward = min(group_scores.values()) if group_scores else 0.0
+    strict = bool(rows) and all(r["passed"] for r in rows)
+    return {"rows": rows, "groups": group_scores, "reward": reward, "strict_pass": strict}
+
+
+# --------------------------------------------------------------------------- commands
+
+def _scenarios(paths: list[str]) -> list[str]:
+    out = []
+    for p in paths:
+        if os.path.isdir(p):
+            out += sorted(os.path.join(p, n) for n in os.listdir(p) if n.endswith(".json"))
+        else:
+            out.append(p)
+    return out
+
+
+def _run_all(task, scen_paths, elf, work, jobs):
+    with cf.ThreadPoolExecutor(max_workers=jobs) as ex:
+        futs = [ex.submit(run_scenario, task, p, elf, os.path.join(work, f"s{i:02d}"))
+                for i, p in enumerate(scen_paths)]
+        return [f.result() for f in futs]
+
+
+def _failed_build(scen_paths):
+    out = []
+    for p in scen_paths:
+        with open(p) as f:
+            s = json.load(f)
+        s.setdefault("name", os.path.splitext(os.path.basename(p))[0])
+        out.append({"scenario": s, "build_failed": True, "frames": [], "notes": []})
+    return out
+
+
+def cmd_run(a) -> int:
+    task = load_task(a.task)
+    scen_paths = _scenarios(a.scenario or [os.path.join(task["dir"], "scenarios")])
+    work = tempfile.mkdtemp(prefix="zr-")
+    app = os.path.join(work, "app")
+    copied = stage(a.project, task, app)
+    print(f"copied into the build: {', '.join(copied) or 'nothing'}")
+    b = build(app, work, task, drop_privileges=False)
+    print(f"build: {'ok' if b['ok'] else 'FAILED'} in {b['seconds']:.1f} s")
+    if not b["ok"]:
+        print(b["log"][-4000:])
+        results = _failed_build(scen_paths)
+    else:
+        results = _run_all(task, scen_paths, b["elf"], work, a.jobs)
+    s = score(results)
+    for res in results:
+        sc = res["scenario"]
+        print(f"\n== {sc['name']} ({res.get('wall_s', 0)} s wall)")
+        for n in res.get("notes", []):
+            print(f"   note: {n}")
+        if a.frames:
+            for f in res.get("frames", []):
+                print(f"   frame {f['t']:.6f} s id 0x{f['id']:x} {f['data'].hex()}")
+    for r in s["rows"]:
+        print(f"{'PASS' if r['passed'] else 'FAIL'}  [{r['group']}] {r['name']}: {r['detail']}")
+    print("\ngroups: " + ", ".join(f"{g} {v:.2f}" for g, v in sorted(s["groups"].items())))
+    print(f"score {s['reward']:.3f} (lowest group), strict pass: {s['strict_pass']}")
+    print(f"work folder (build log, uart.txt, can0.txt per scenario): {work}")
+    return 0
+
+
+def _check_unreadable(paths: list[str]) -> None:
+    """The build user must not be able to read any scenario file or folder."""
+    for p in paths:
+        r = subprocess.run(["runuser", "-u", BUILD_USER, "--", "test", "-r", p], capture_output=True)
+        if r.returncode == 0:
+            raise HarnessError(f"{p} is readable by {BUILD_USER}")
+
+
+def cmd_grade(a) -> int:
+    if os.geteuid() != 0:
+        raise HarnessError("grade runs as root")
+    task = load_task(a.task)
+    scen_paths = _scenarios([a.scenarios])
+    if not scen_paths:
+        raise HarnessError(f"no scenarios in {a.scenarios}")
+    _check_unreadable([a.scenarios, *scen_paths])
+    work = tempfile.mkdtemp(prefix="zr-grade-")
+    os.chmod(work, 0o755)
+    app = os.path.join(work, "app")
+    copied = stage(a.project, task, app)
+    b = build(app, work, task, drop_privileges=True)
+    if b["ok"]:
+        results = _run_all(task, scen_paths, b["elf"], work, a.jobs)
+    else:
+        results = _failed_build(scen_paths)
+    s = score(results)
+    failed = [r["name"] for r in s["rows"] if not r["passed"]]
+    if not b["ok"]:
+        category = "build_failed"
+    elif s["strict_pass"]:
+        category = None
+    else:
+        category = "tests_failed"
+    reward = 0.0 if not b["ok"] else round(s["reward"], 4)
+    out = {
+        "reward": reward,
+        "strict_pass": bool(b["ok"] and s["strict_pass"]),
+        "counters": {f"group_{g}": round(v, 4) for g, v in s["groups"].items()}
+                    | {"build_seconds": round(b["seconds"], 1),
+                       "renode_seconds": round(sum(r.get("wall_s", 0) for r in results), 1)},
+        "failure_category": category,
+        "flags": sorted({"sim_timeout" for r in results if r.get("timed_out")}
+                        | {"sensor_not_started" for r in results if r.get("sensor_not_started")}),
+        "info": {
+            "checks": [r["name"] for r in s["rows"]],
+            "failed": failed,
+            "details": {r["name"]: r["detail"] for r in s["rows"]},
+            "groups": s["groups"],
+            "copied": copied,
+            "build_log_tail": None if b["ok"] else b["log"][-3000:],
+            "scenarios": {r["scenario"]["name"]: {
+                "wall_s": r.get("wall_s"), "instructions": r.get("instructions"), "notes": r.get("notes", []),
+                "frames": [[round(f["t"], 6), f"0x{f['id']:x}", f["data"].hex()] for f in r.get("frames", [])][:200],
+            } for r in results},
+        },
+    }
+    os.makedirs(os.path.dirname(a.out), exist_ok=True)
+    with open(a.out, "w") as f:
+        json.dump(out, f, indent=1)
+    print(json.dumps({k: out[k] for k in ("reward", "strict_pass", "failure_category", "counters")}))
+    return 0
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(prog="zr-scenario", description=__doc__.split("\n\n")[0])
+    sub = p.add_subparsers(dest="cmd", required=True)
+    r = sub.add_parser("run", help="build and run against scenarios, as the grader does")
+    r.add_argument("--project", default=os.environ.get("ZR_PROJECT", "."))
+    r.add_argument("--task", default=os.environ.get("ZR_TASK", "/opt/zr-task"))
+    r.add_argument("--jobs", type=int, default=max(1, (os.cpu_count() or 2) // 2))
+    r.add_argument("--frames", action="store_true", help="print every CAN frame seen on the hub")
+    r.add_argument("scenario", nargs="*")
+    g = sub.add_parser("grade", help="grader: build as zbuild, run hidden scenarios, write reward.json")
+    g.add_argument("--project", required=True)
+    g.add_argument("--task", default="/opt/zr-task")
+    g.add_argument("--scenarios", required=True)
+    g.add_argument("--out", default="/out/reward.json")
+    g.add_argument("--jobs", type=int, default=max(1, (os.cpu_count() or 2) // 2))
+    a = p.parse_args()
+    try:
+        return cmd_run(a) if a.cmd == "run" else cmd_grade(a)
+    except HarnessError as e:
+        print(f"zr-scenario: harness error: {e}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
