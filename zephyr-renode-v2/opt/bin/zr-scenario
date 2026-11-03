@@ -40,6 +40,8 @@ COPY_IN_FILES = ("prj.conf", "app.overlay")
 COPY_IN_DIRS = ("src",)
 BUILD_USER = "zbuild"
 RENODE_TIMEOUT_S = 240
+RENODE_MAX_RSS = 4 << 30        # a Renode past this is stopped; its scenario fails (flag sim_memory)
+JOB_MEMORY = 3 << 30            # memory budgeted per parallel Renode
 CSV2RESD = "/opt/renode/tools/csv2resd/csv2resd.py"
 G = 9.80665
 
@@ -219,6 +221,38 @@ def _script(task: dict, scen: dict, scen_dir: str, elf: str, work: str) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _rss(pid: int) -> int:
+    try:
+        for line in open(f"/proc/{pid}/status"):
+            if line.startswith("VmRSS:"):
+                return int(line.split()[1]) * 1024
+    except OSError:
+        pass
+    return 0
+
+
+def _run_renode(resc: str, out_path: str):
+    """Renode on a script, with a wall-time limit and a memory limit. Returns (console, rc, timed_out, mem_killed)."""
+    with open(out_path, "w+", errors="replace") as out:
+        p = subprocess.Popen(["renode", "--disable-gui", "--console", "--hide-log", "--plain", "-P", "-1", resc],
+                             stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT)
+        t0, timed_out, mem_killed = time.monotonic(), False, False
+        while p.poll() is None:
+            if time.monotonic() - t0 > RENODE_TIMEOUT_S:
+                timed_out = True
+            elif _rss(p.pid) > RENODE_MAX_RSS:
+                mem_killed = True
+            if timed_out or mem_killed:
+                p.kill()
+                p.wait()
+                break
+            time.sleep(0.5)
+        out.seek(0)
+        log = out.read()
+    rc = None if (timed_out or mem_killed) else p.returncode
+    return log, rc, timed_out, mem_killed
+
+
 def run_scenario(task: dict, scen_path: str, elf: str, work: str) -> dict:
     with open(scen_path) as f:
         scen = json.load(f)
@@ -230,15 +264,9 @@ def run_scenario(task: dict, scen_path: str, elf: str, work: str) -> dict:
     t = time.monotonic()
     retried = False
     while True:
-        rc = None
-        try:
-            r = subprocess.run(["renode", "--disable-gui", "--console", "--hide-log", "--plain", "-P", "-1", resc],
-                               stdin=subprocess.DEVNULL, capture_output=True, text=True, errors="replace",
-                               timeout=RENODE_TIMEOUT_S)
-            log, timed_out, rc = r.stdout + r.stderr, False, r.returncode
-        except subprocess.TimeoutExpired as e:
-            log = (e.stdout or b"").decode(errors="replace") if isinstance(e.stdout, bytes) else (e.stdout or "")
-            timed_out = True
+        log, rc, timed_out, mem_killed = _run_renode(resc, os.path.join(work, "monitor.part"))
+        if mem_killed:
+            break
         # Renode killed by a signal (seen under memory pressure: the box's OOM killer) says nothing
         # about the firmware. A run is deterministic, so running it again gives the true result.
         early = (rc is not None and rc < 0) or ("ZR-END" not in log and "There was an error" not in log
@@ -250,7 +278,10 @@ def run_scenario(task: dict, scen_path: str, elf: str, work: str) -> dict:
     wall = time.monotonic() - t
     with open(os.path.join(work, "monitor.txt"), "w") as f:
         f.write(log)
-    res = {"scenario": scen, "wall_s": round(wall, 2), "timed_out": timed_out, "notes": [], "renode_retried": retried}
+    res = {"scenario": scen, "wall_s": round(wall, 2), "timed_out": timed_out or mem_killed, "notes": [],
+           "renode_retried": retried, "sim_memory": mem_killed}
+    if mem_killed:
+        res["notes"].append(f"simulation passed {RENODE_MAX_RSS >> 30} GB of memory and was stopped")
     if "error CS" in log:
         raise HarnessError(f"a C# include failed to compile: {_first(log, 'error CS')}")
     errors = re.findall(r"There was an error executing command '([^']*)':\s*\n([^\n]*)", log)
@@ -263,7 +294,7 @@ def run_scenario(task: dict, scen_path: str, elf: str, work: str) -> dict:
             res["sensor_not_started"] = True
         else:
             raise HarnessError(f"Renode refused {cmd!r}: {why}")
-    if not timed_out and "ZR-END" not in log and not res.get("sensor_not_started"):
+    if not timed_out and not mem_killed and "ZR-END" not in log and not res.get("sensor_not_started"):
         tail = ""
         try:
             tail = "".join(open(os.path.join(work, "renode-log.txt"), errors="replace").readlines()[-15:])
@@ -475,7 +506,8 @@ def cmd_grade(a) -> int:
         "failure_category": category,
         "flags": sorted({"sim_timeout" for r in results if r.get("timed_out")}
                         | {"sensor_not_started" for r in results if r.get("sensor_not_started")}
-                        | {"renode_retried" for r in results if r.get("renode_retried")}),
+                        | {"renode_retried" for r in results if r.get("renode_retried")}
+                        | {"sim_memory" for r in results if r.get("sim_memory")}),
         "info": {
             "checks": [r["name"] for r in s["rows"]],
             "failed": failed,
@@ -497,7 +529,7 @@ def cmd_grade(a) -> int:
 
 
 def default_jobs() -> int:
-    """Parallel Renode runs: half the CPUs, at most 6, and about 1.75 GB of memory each.
+    """Parallel Renode runs: half the CPUs, at most 6, and JOB_MEMORY (3 GB) of memory each.
 
     One Renode took 1.2 to 1.6 GB on a heavy firmware (a model's, 3 Nov); six at once reached 9.5 GB and
     the kernel killed them. The memory is the container's limit, or what the machine has free.
@@ -518,7 +550,7 @@ def default_jobs() -> int:
         except (OSError, ValueError):
             pass
     if mem is not None:
-        jobs = min(jobs, max(1, int(mem // (1.75 * (1 << 30)))))
+        jobs = min(jobs, max(1, int(mem // JOB_MEMORY)))
     return min(jobs, 6)
 
 
