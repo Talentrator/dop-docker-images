@@ -179,7 +179,10 @@ def _resd(trace_csv: str, rate_hz: float, start_s: float, out: str) -> None:
 
 
 def _script(task: dict, scen: dict, scen_dir: str, elf: str, work: str) -> str:
-    lines = [f"include @{p}" for p in task.get("includes", [])]
+    # Renode's log goes to a file: on the console it interleaves with Monitor output mid-line
+    # (seen: "Z[12:21:31] ... Machine paused." then "R-END"), which breaks reading the markers.
+    lines = [f"logFile @{work}/renode-log.txt"]
+    lines += [f"include @{p}" for p in task.get("includes", [])]
     lines += [
         f"emulation SetSeed {int(task.get('seed', 1))}",
         "emulation SetAdvanceImmediately true",
@@ -226,7 +229,7 @@ def run_scenario(task: dict, scen_path: str, elf: str, work: str) -> dict:
         f.write(_script(task, scen, os.path.dirname(scen_path), elf, work))
     t = time.monotonic()
     try:
-        r = subprocess.run(["renode", "--disable-gui", "--console", "--plain", "-P", "-1", resc],
+        r = subprocess.run(["renode", "--disable-gui", "--console", "--hide-log", "--plain", "-P", "-1", resc],
                            stdin=subprocess.DEVNULL, capture_output=True, text=True, errors="replace",
                            timeout=RENODE_TIMEOUT_S)
         log, timed_out = r.stdout + r.stderr, False
@@ -234,7 +237,7 @@ def run_scenario(task: dict, scen_path: str, elf: str, work: str) -> dict:
         log = (e.stdout or b"").decode(errors="replace") if isinstance(e.stdout, bytes) else (e.stdout or "")
         timed_out = True
     wall = time.monotonic() - t
-    with open(os.path.join(work, "renode.log"), "w") as f:
+    with open(os.path.join(work, "monitor.txt"), "w") as f:
         f.write(log)
     res = {"scenario": scen, "wall_s": round(wall, 2), "timed_out": timed_out, "notes": []}
     if "error CS" in log:
@@ -242,12 +245,14 @@ def run_scenario(task: dict, scen_path: str, elf: str, work: str) -> dict:
     errors = re.findall(r"There was an error executing command '([^']*)':\s*\n([^\n]*)", log)
     for cmd, why in errors:
         if "Frequency must be higher than zero" in why:
-            # the firmware had not started the sensor by feed_at_s: the firmware's doing, not ours
-            res["notes"].append(f"sensor not started by {task.get('feed_at_s', 0.1)} s, so its trace never played")
+            # The firmware had not started the sensor by feed_at_s: the firmware's doing, not ours.
+            # Renode stops the script at the error, so the rest of the scenario never ran and
+            # every check of it fails (a check such as no_alert would otherwise pass on nothing).
+            res["notes"].append(f"sensor not started by {task.get('feed_at_s', 0.1)} s, so the scenario did not run")
             res["sensor_not_started"] = True
         else:
             raise HarnessError(f"Renode refused {cmd!r}: {why}")
-    if not timed_out and "ZR-END" not in log:
+    if not timed_out and "ZR-END" not in log and not res.get("sensor_not_started"):
         raise HarnessError(f"Renode stopped before the end of {scen['name']}: {log[-1500:]}")
     if timed_out:
         res["notes"].append(f"simulation did not finish within {RENODE_TIMEOUT_S} s of wall time")
@@ -333,6 +338,8 @@ def score(results: list[dict]) -> dict:
             group = c.get("group", scen.get("group", "main"))
             if res.get("build_failed"):
                 ok, why = False, "no build"
+            elif res.get("sensor_not_started"):
+                ok, why = False, "sensor not started, scenario did not run"
             else:
                 ok, why = check(c, res)
                 if res.get("timed_out"):
