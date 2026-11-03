@@ -228,18 +228,27 @@ def run_scenario(task: dict, scen_path: str, elf: str, work: str) -> dict:
     with open(resc, "w") as f:
         f.write(_script(task, scen, os.path.dirname(scen_path), elf, work))
     t = time.monotonic()
-    try:
-        r = subprocess.run(["renode", "--disable-gui", "--console", "--hide-log", "--plain", "-P", "-1", resc],
-                           stdin=subprocess.DEVNULL, capture_output=True, text=True, errors="replace",
-                           timeout=RENODE_TIMEOUT_S)
-        log, timed_out = r.stdout + r.stderr, False
-    except subprocess.TimeoutExpired as e:
-        log = (e.stdout or b"").decode(errors="replace") if isinstance(e.stdout, bytes) else (e.stdout or "")
-        timed_out = True
+    retried = False
+    while True:
+        rc = None
+        try:
+            r = subprocess.run(["renode", "--disable-gui", "--console", "--hide-log", "--plain", "-P", "-1", resc],
+                               stdin=subprocess.DEVNULL, capture_output=True, text=True, errors="replace",
+                               timeout=RENODE_TIMEOUT_S)
+            log, timed_out, rc = r.stdout + r.stderr, False, r.returncode
+        except subprocess.TimeoutExpired as e:
+            log = (e.stdout or b"").decode(errors="replace") if isinstance(e.stdout, bytes) else (e.stdout or "")
+            timed_out = True
+        # Renode killed by a signal (seen under memory pressure: the box's OOM killer) says nothing
+        # about the firmware. A run is deterministic, so running it again gives the true result.
+        if rc is not None and rc < 0 and not retried:
+            retried = True
+            continue
+        break
     wall = time.monotonic() - t
     with open(os.path.join(work, "monitor.txt"), "w") as f:
         f.write(log)
-    res = {"scenario": scen, "wall_s": round(wall, 2), "timed_out": timed_out, "notes": []}
+    res = {"scenario": scen, "wall_s": round(wall, 2), "timed_out": timed_out, "notes": [], "renode_retried": retried}
     if "error CS" in log:
         raise HarnessError(f"a C# include failed to compile: {_first(log, 'error CS')}")
     errors = re.findall(r"There was an error executing command '([^']*)':\s*\n([^\n]*)", log)
@@ -253,7 +262,13 @@ def run_scenario(task: dict, scen_path: str, elf: str, work: str) -> dict:
         else:
             raise HarnessError(f"Renode refused {cmd!r}: {why}")
     if not timed_out and "ZR-END" not in log and not res.get("sensor_not_started"):
-        raise HarnessError(f"Renode stopped before the end of {scen['name']}: {log[-1500:]}")
+        tail = ""
+        try:
+            tail = "".join(open(os.path.join(work, "renode-log.txt"), errors="replace").readlines()[-15:])
+        except OSError:
+            pass
+        raise HarnessError(f"Renode stopped before the end of {scen['name']} (exit {rc}): {log[-600:]}\n"
+                           f"last log lines:\n{tail}")
     if timed_out:
         res["notes"].append(f"simulation did not finish within {RENODE_TIMEOUT_S} s of wall time")
     # the value Renode prints for `sysbus.cpu ExecutedInstructions`, the first hex line after ZR-END
@@ -457,7 +472,8 @@ def cmd_grade(a) -> int:
                        "renode_seconds": round(sum(r.get("wall_s", 0) for r in results), 1)},
         "failure_category": category,
         "flags": sorted({"sim_timeout" for r in results if r.get("timed_out")}
-                        | {"sensor_not_started" for r in results if r.get("sensor_not_started")}),
+                        | {"sensor_not_started" for r in results if r.get("sensor_not_started")}
+                        | {"renode_retried" for r in results if r.get("renode_retried")}),
         "info": {
             "checks": [r["name"] for r in s["rows"]],
             "failed": failed,
@@ -478,13 +494,25 @@ def cmd_grade(a) -> int:
     return 0
 
 
+def default_jobs() -> int:
+    """Parallel Renode runs: half the CPUs, at most 6, and about 1 GB of the box's memory each."""
+    jobs = max(1, (os.cpu_count() or 2) // 2)
+    try:
+        lim = open("/sys/fs/cgroup/memory.max").read().strip()
+        if lim != "max":
+            jobs = min(jobs, max(1, int(lim) // (1 << 30) - 1))
+    except (OSError, ValueError):
+        pass
+    return min(jobs, 6)
+
+
 def main() -> int:
     p = argparse.ArgumentParser(prog="zr-scenario", description=__doc__.split("\n\n")[0])
     sub = p.add_subparsers(dest="cmd", required=True)
     r = sub.add_parser("run", help="build and run against scenarios, as the grader does")
     r.add_argument("--project", default=os.environ.get("ZR_PROJECT", "."))
     r.add_argument("--task", default=os.environ.get("ZR_TASK", "/opt/zr-task"))
-    r.add_argument("--jobs", type=int, default=max(1, (os.cpu_count() or 2) // 2))
+    r.add_argument("--jobs", type=int, default=default_jobs())
     r.add_argument("--frames", action="store_true", help="print every CAN frame seen on the hub")
     r.add_argument("scenario", nargs="*")
     g = sub.add_parser("grade", help="grader: build as zbuild, run hidden scenarios, write reward.json")
@@ -492,7 +520,7 @@ def main() -> int:
     g.add_argument("--task", default="/opt/zr-task")
     g.add_argument("--scenarios", required=True)
     g.add_argument("--out", default="/out/reward.json")
-    g.add_argument("--jobs", type=int, default=max(1, (os.cpu_count() or 2) // 2))
+    g.add_argument("--jobs", type=int, default=default_jobs())
     a = p.parse_args()
     try:
         return cmd_run(a) if a.cmd == "run" else cmd_grade(a)
