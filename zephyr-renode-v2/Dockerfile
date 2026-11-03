@@ -23,6 +23,12 @@ RUN set -eux; \
 
 USER root
 RUN useradd --uid 1001 --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin zbuild
+# DOP runs every agent command as `su - <user> -c ...`, a login shell that drops the image's ENV
+# (no /opt/venv/bin on PATH, no ZEPHYR_BASE or SDK): west and zr-scenario then fail. Login shells
+# read /etc/profile.d, so the image's environment is written there.
+RUN { env | grep -E '^(ZEPHYR_[A-Z_]*|RENODE_[A-Z_]*|VIRTUAL_ENV|CCACHE_DIR|LANG|LC_ALL)=' | sort | sed 's/^/export /'; \
+      echo 'export PATH="/opt/venv/bin:$PATH"'; } > /etc/profile.d/zephyr-renode.sh \
+ && cat /etc/profile.d/zephyr-renode.sh
 COPY opt/ /opt/zephyr-v2/
 RUN chown -R root:root /opt/zephyr-v2 \
     && chmod -R u=rwX,go=rX /opt/zephyr-v2 \
