@@ -256,7 +256,8 @@ def run_scenario(task: dict, scen_path: str, elf: str, work: str) -> dict:
         raise HarnessError(f"Renode stopped before the end of {scen['name']}: {log[-1500:]}")
     if timed_out:
         res["notes"].append(f"simulation did not finish within {RENODE_TIMEOUT_S} s of wall time")
-    m = re.search(r"ExecutedInstructions\s*\n\s*(0x[0-9A-Fa-f]+)", log)
+    # the value Renode prints for `sysbus.cpu ExecutedInstructions`, the first hex line after ZR-END
+    m = re.search(r"ZR-END\s*\n(?:\s*\n)*\s*(0x[0-9A-Fa-f]+)", log)
     res["instructions"] = int(m.group(1), 16) if m else None
     res["frames"] = []
     for i, _ in enumerate(task.get("can", [])):
