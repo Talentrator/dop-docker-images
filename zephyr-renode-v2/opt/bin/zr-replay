@@ -1,0 +1,218 @@
+#!/usr/bin/env python3
+"""zr-replay: replay an author's withheld step list in the box and record it as a trajectory.
+
+  zr-replay STEPS.md [--workdir /workdir/tcu] [--user zephyr] [--files DIR] [--out trajectory.jsonl]
+            [--report report.json] [--dry-run]
+
+Every command of the step list runs the way DOP runs a model's command (a fresh login shell of the
+task's user, `cd <workdir> && <command>`; as root it switches user with `su -`, otherwise it runs
+as the caller). Its output is compared loosely with what the author wrote down (the exit code and
+named lines, by regular expression), and the real outputs are written as a trajectory JSONL in
+the shape DOP's runs use (a "model" entry with the tool call, then a "tool" entry with the output),
+ending with a submit, so a trainer can read it like a model's run.
+
+Step list format (Markdown, version 1):
+
+  ## <step title>
+  <free text: what the author did and why; becomes the reasoning of the step's first call>
+
+  ```sh
+  <one command, or several lines run as one call>
+  ```
+  - expect exit 0                  (the default; "expect exit any" turns it off)
+  - expect line: <regex>           (some line of the output matches)
+  - expect no line: <regex>        (no line of the output matches)
+
+  ```c file=src/impact.h
+  <the whole file; replayed as `cat > 'src/impact.h' <<'ZR_EOF' ... ZR_EOF`>
+  ```
+  ```c file=src/impact.c src=gold/src/impact.c
+  ```                              (the content comes from --files DIR/gold/src/impact.c)
+
+Each fenced block is one call. Expectations apply to the block just before them. A step may hold
+several blocks. Text outside blocks and expectations is the step's note. Exit status: 0 if every
+expectation held, 1 if not, 2 if the step list cannot be read.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+
+ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+FENCE = re.compile(r"^```(\S*)\s*(.*)$")
+EXPECT = re.compile(r"^\s*[-*]?\s*expect\s+(exit|line:|no line:)\s*(.*?)\s*$", re.IGNORECASE)
+HEREDOC_END = "ZR_EOF"
+TRAJ_KEYS = ("index", "kind", "tool", "command", "output", "reasoning", "reasoning_details", "tool_calls",
+             "image", "budget", "exit_code", "duration_s", "input_tokens", "output_tokens", "reasoning_tokens",
+             "cached_tokens", "cache_write_tokens", "served_by", "malformed_calls", "ts")
+
+
+class StepsError(Exception):
+    pass
+
+
+def parse(path: str, files_dir: str) -> list[dict]:
+    """Steps: [{title, note, calls: [{command, expect: {exit, lines, no_lines}}]}]."""
+    steps: list[dict] = []
+    lines = open(path).read().splitlines()
+    i = 0
+    cur = None
+    while i < len(lines):
+        line = lines[i]
+        if line.startswith("## "):
+            cur = {"title": line[3:].strip(), "note": [], "calls": []}
+            steps.append(cur)
+            i += 1
+            continue
+        if cur is None:
+            i += 1
+            continue
+        m = FENCE.match(line)
+        if m:
+            lang, attrs = m.group(1), dict(a.split("=", 1) for a in m.group(2).split() if "=" in a)
+            body = []
+            i += 1
+            while i < len(lines) and not lines[i].startswith("```"):
+                body.append(lines[i])
+                i += 1
+            if i >= len(lines):
+                raise StepsError(f"{path}: a code block in step {cur['title']!r} is not closed")
+            i += 1
+            if "file" in attrs:
+                rel = attrs["file"]
+                if "src" in attrs:
+                    content = open(os.path.join(files_dir, attrs["src"])).read().rstrip("\n")
+                else:
+                    content = "\n".join(body)
+                if HEREDOC_END in content:
+                    raise StepsError(f"{rel}: the content holds the heredoc marker {HEREDOC_END}")
+                cmd = (f"mkdir -p \"$(dirname '{rel}')\" && cat > '{rel}' <<'{HEREDOC_END}'\n"
+                       f"{content}\n{HEREDOC_END}")
+            elif lang in ("sh", "bash", "shell", "console", ""):
+                cmd = "\n".join(body).strip()
+            else:
+                raise StepsError(f"{path}: a ```{lang} block needs file=PATH (step {cur['title']!r})")
+            cur["calls"].append({"command": cmd, "expect": {"exit": 0, "lines": [], "no_lines": []}})
+            continue
+        m = EXPECT.match(line)
+        if m:
+            if not cur["calls"]:
+                raise StepsError(f"{path}: an expectation before any command in step {cur['title']!r}")
+            e = cur["calls"][-1]["expect"]
+            what, arg = m.group(1).lower(), m.group(2)
+            if what == "exit":
+                e["exit"] = None if arg.lower() == "any" else int(arg)
+            else:
+                try:
+                    re.compile(arg)
+                except re.error as err:
+                    raise StepsError(f"{path}: bad pattern {arg!r}: {err}")
+                (e["lines"] if what == "line:" else e["no_lines"]).append(arg)
+            i += 1
+            continue
+        cur["note"].append(line)
+        i += 1
+    for s in steps:
+        s["note"] = "\n".join(s["note"]).strip()
+    if not any(s["calls"] for s in steps):
+        raise StepsError(f"{path}: no commands")
+    return steps
+
+
+def run(command: str, workdir: str, user: str | None, timeout: float) -> tuple[int, str, float]:
+    full = f"cd {workdir} && {command}"
+    argv = ["su", "-", user, "-c", full] if (user and os.geteuid() == 0) else ["bash", "-lc", full]
+    t0 = time.monotonic()
+    try:
+        r = subprocess.run(argv, capture_output=True, text=True, errors="replace", timeout=timeout)
+        rc, out = r.returncode, r.stdout + r.stderr
+    except subprocess.TimeoutExpired as e:
+        rc, out = 124, ((e.stdout or b"").decode(errors="replace") if isinstance(e.stdout, bytes) else (e.stdout or ""))
+        out += f"\n(timed out after {timeout:g} s)"
+    return rc, out, time.monotonic() - t0
+
+
+def compare(expect: dict, rc: int, out: str) -> list[str]:
+    misses = []
+    if expect["exit"] is not None and rc != expect["exit"]:
+        misses.append(f"exit {rc}, expected {expect['exit']}")
+    text = ANSI.sub("", out).splitlines()
+    for pat in expect["lines"]:
+        if not any(re.search(pat, l) for l in text):
+            misses.append(f"no line matches {pat!r}")
+    for pat in expect["no_lines"]:
+        hit = next((l for l in text if re.search(pat, l)), None)
+        if hit is not None:
+            misses.append(f"a line matches {pat!r}: {hit.strip()[:120]!r}")
+    return misses
+
+
+def entry(**kw) -> dict:
+    return {k: kw.get(k) for k in TRAJ_KEYS}
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(prog="zr-replay", description=__doc__.split("\n\n")[0])
+    p.add_argument("steps")
+    p.add_argument("--workdir", default=os.environ.get("ZR_PROJECT", "/workdir/tcu"))
+    p.add_argument("--user", default="zephyr", help="the task's agent user (used when run as root)")
+    p.add_argument("--files", help="folder that src= paths are relative to (default: the step list's folder)")
+    p.add_argument("--out", default="replay-trajectory.jsonl")
+    p.add_argument("--report", help="also write the comparison as JSON here")
+    p.add_argument("--timeout", type=float, default=900.0, help="per command, seconds")
+    p.add_argument("--dry-run", action="store_true", help="parse and print the calls, run nothing")
+    a = p.parse_args()
+    try:
+        steps = parse(a.steps, a.files or os.path.dirname(os.path.abspath(a.steps)))
+    except (StepsError, OSError) as e:
+        print(f"zr-replay: {e}", file=sys.stderr)
+        return 2
+    if a.dry_run:
+        for n, s in enumerate(steps, 1):
+            print(f"{n}. {s['title']}")
+            for c in s["calls"]:
+                print(f"   $ {c['command'].splitlines()[0][:100]}  expect {c['expect']}")
+        return 0
+    traj, report = [], []
+    calls = 0
+    for n, s in enumerate(steps, 1):
+        for k, c in enumerate(s["calls"]):
+            cid = f"bash:{calls}"
+            calls += 1
+            note = s["note"] if k == 0 else None
+            traj.append(entry(index=len(traj), kind="model", command="bash", reasoning=note or None,
+                              tool_calls=[{"id": cid, "name": "bash", "argument": c["command"],
+                                           "input": {"command": c["command"]}}], ts=time.time()))
+            rc, out, secs = run(c["command"], a.workdir, a.user, a.timeout)
+            misses = compare(c["expect"], rc, out)
+            traj.append(entry(index=len(traj), kind="tool", tool="bash", command=c["command"], output=out,
+                              exit_code=rc, duration_s=secs, ts=time.time()))
+            report.append({"step": n, "title": s["title"], "call": k + 1, "command": c["command"].splitlines()[0][:200],
+                           "exit_code": rc, "seconds": round(secs, 1), "expect": c["expect"],
+                           "matched": not misses, "mismatches": misses})
+            print(f"{'ok  ' if not misses else 'DIFF'} step {n}.{k + 1} ({secs:5.1f} s, exit {rc}) {s['title']}"
+                  + "".join(f"\n       {m}" for m in misses))
+    notes = f"Replay of {os.path.basename(a.steps)}: {len(steps)} steps."
+    traj.append(entry(index=len(traj), kind="model", command="submit",
+                      tool_calls=[{"id": f"submit:{calls}", "name": "submit", "argument": notes,
+                                   "input": {"notes": notes}}], ts=time.time()))
+    traj.append(entry(index=len(traj), kind="tool", tool="submit", command=notes, output="(submitted)", ts=time.time()))
+    with open(a.out, "w") as f:
+        for t in traj:
+            f.write(json.dumps(t) + "\n")
+    held = sum(r["matched"] for r in report)
+    summary = {"steps": len(steps), "calls": len(report), "matched": held, "calls_detail": report}
+    if a.report:
+        with open(a.report, "w") as f:
+            json.dump(summary, f, indent=1)
+    print(f"\n{held} of {len(report)} calls as the author wrote them; trajectory: {a.out} ({len(traj)} entries)")
+    return 0 if held == len(report) else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

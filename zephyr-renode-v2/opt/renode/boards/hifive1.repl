@@ -1,0 +1,8 @@
+// hifive1 for the board check: Renode 1.17's platforms/cpus/sifive-fe310.repl with the CLINT's timer
+// (mtime) counting at 16 MHz, the rate Zephyr's hifive1 programs its system timer for
+// (sys_clock_hw_cycles_per_sec() = 16000000). Renode's file counts it at 62 MHz, so every kernel
+// period came out 3.9 times too short (k_busy_wait(1 ms) held a pin 0.258 ms).
+using "platforms/cpus/sifive-fe310.repl"
+
+clint:
+    frequency: 16000000
