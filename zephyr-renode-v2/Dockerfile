@@ -3,14 +3,16 @@
 # Zephyr + Renode V2: ../zephyr-renode with what scored scenario tasks need on top.
 #   - hal_st and hal_tdk: without them the ST MEMS sensors (LIS2DW12, LSM6DSO, IIS2MDC, ...) and
 #     ICP-101xx do not build (Kconfig stops at HAS_STMEMSC / USE_EMD_ICP101XX)
-#   - /opt/zephyr-v2: the scenario runner (zr-scenario) and the Renode files it loads: a patched
-#     bxCAN model (STMCANZephyr.cs), a CAN hub recorder (CANRecorder.cs), the nucleo_f767zi
-#     platform using both, and that platform's SVD (the grader box has no network)
+#   - /opt/zephyr-v2: the scenario runner (zr-scenario, events and checks in RUNNER.md), the step-list
+#     replay tool (zr-replay), and the Renode files they load: patched models where Renode's differ from
+#     the chip (STMCANZephyr.cs, LIS2DW12Fixed.cs, boards/*.cs), recorders (CANRecorder.cs,
+#     GPIORecorder.cs, ZRScenarioTools.cs), and per-board platform files with local SVDs under boards/
+#     (the grader box has no network)
 #   - zbuild: the unprivileged user the grader builds a model's project as (no sudo, no home)
 #
-# Build: docker build -t zephyr-renode-v2 .   (BASE pins ../zephyr-renode)
+# Build: docker build -t zephyr-renode-v2 .   (BASE pins ../zephyr-renode by digest: the 29 Oct build)
 
-ARG BASE=ghcr.io/talentrator/dop-docker-images/zephyr-renode:latest
+ARG BASE=ghcr.io/talentrator/dop-docker-images/zephyr-renode@sha256:33c8bd54608f0a95854abdbfb7924acdf675caf86c9b0e8a060a35b49ef2a2c9
 FROM ${BASE}
 
 USER zephyr
@@ -33,7 +35,8 @@ COPY opt/ /opt/zephyr-v2/
 RUN chown -R root:root /opt/zephyr-v2 \
     && chmod -R u=rwX,go=rX /opt/zephyr-v2 \
     && chmod 755 /opt/zephyr-v2/bin/* \
-    && ln -s /opt/zephyr-v2/bin/zr-scenario /usr/local/bin/zr-scenario
+    && ln -s /opt/zephyr-v2/bin/zr-scenario /usr/local/bin/zr-scenario \
+    && ln -s /opt/zephyr-v2/bin/zr-replay /usr/local/bin/zr-replay
 
 USER zephyr
 WORKDIR /workdir
