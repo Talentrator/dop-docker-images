@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Builds hello_world for each Renode board and runs it on Renode, has
 # renode-test check one board's UART from a Robot test, then has twister
-# build and run hello_world once on the board Zephyr itself runs on Renode.
+# build and run hello_world once on the board Zephyr itself runs on Renode,
+# and runs TensorFlow Lite Micro's hello_world with CMSIS-NN kernels on Renode.
 # Usage: zephyr-smoke-test [board ...]
 set -uo pipefail
 
@@ -58,6 +59,16 @@ if west twister -p cortex_r8_virtual -T "$ZEPHYR_BASE/samples/hello_world" -O "$
   pass+=("twister")
 else
   fail+=("twister"); tail -n 30 "$OUT/twister.log"
+fi
+
+echo "==> TensorFlow Lite Micro + CMSIS-NN: tflite-micro hello_world on nucleo_f767zi"
+dir="$OUT/tflm"
+if west build -p always -b nucleo_f767zi -d "$dir" "$ZEPHYR_BASE/samples/modules/tflite-micro/hello_world" \
+     -- -DCONFIG_TENSORFLOW_LITE_MICRO_CMSIS_NN_KERNELS=y >"$dir.log" 2>&1 \
+   && zephyr-renode-run -t 2 "$dir" >"$dir.run.log" 2>&1 && grep -q "x_value:.*y_value:" "$dir.run.log"; then
+  pass+=("tflite-micro")
+else
+  fail+=("tflite-micro"); tail -n 20 "$dir.log" "$dir.run.log" 2>/dev/null
 fi
 
 echo
