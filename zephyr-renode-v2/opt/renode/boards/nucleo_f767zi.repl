@@ -1,0 +1,37 @@
+// nucleo_f767zi for the grader and the board check: ../nucleo_f767zi.repl (Renode 1.17's board and
+// CPU files, bxCAN as CAN.STMCANZephyr, local SVD) with what Renode's STM32F7 file leaves out and
+// Zephyr's board uses. Include ../STMCANZephyr.cs and STM32_TimerZephyr.cs before loading.
+//   - TIM1 to TIM4 as STM32_TimerZephyr (Renode's timer with the period fixed to ARR + 1 cycles;
+//     Zephyr's PWM on this board is TIM1 channel 3, PE13). Clocks as Zephyr sets them
+//     up: SYSCLK 216 MHz, APB2 /2 so TIM1 counts at 216 MHz, APB1 /4 so TIM2 to TIM4 at 108 MHz.
+//     Interrupt lines from RM0410 table 46. TIM5 stays out: Renode's file puts a Python stub on
+//     its counter register (0x40000C24).
+//   - IWDG (Zephyr's watchdog0), on the 32 kHz LSI, with the F7's window register.
+using "/opt/zephyr-v2/renode/nucleo_f767zi.repl"
+
+timers1: Timers.STM32_TimerZephyr @ sysbus <0x40010000, +0x400>
+    BreakInterrupt -> nvic@24
+    UpdateInterrupt -> nvic@25
+    [TriggerInterrupt, CommutationInterrupt] -> nvic@[26, 26]
+    CaptureCompareInterrupt -> nvic@27
+    frequency: 216000000
+    initialLimit: 0xFFFF
+
+timers2: Timers.STM32_TimerZephyr @ sysbus <0x40000000, +0x400>
+    -> nvic@28
+    frequency: 108000000
+    initialLimit: 0xFFFFFFFF
+
+timers3: Timers.STM32_TimerZephyr @ sysbus <0x40000400, +0x400>
+    -> nvic@29
+    frequency: 108000000
+    initialLimit: 0xFFFF
+
+timers4: Timers.STM32_TimerZephyr @ sysbus <0x40000800, +0x400>
+    -> nvic@30
+    frequency: 108000000
+    initialLimit: 0xFFFF
+
+iwdg: Timers.STM32_IndependentWatchdog @ sysbus 0x40003000
+    frequency: 32000
+    windowOption: true

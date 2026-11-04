@@ -8,6 +8,10 @@
 //     round, list filters numbered low half first (FilterBank.MatchMessage).
 //  6. RDTR carries the matched filter's number (FMI); it was always 0.
 //  7. Filter banks are tried in the chip's priority order (FilterBank.CompareTo).
+//  8. Filter match index (FMI) numbered per CAN on a dual bxCAN (CAN2 a slave of CAN1, sharing its 28
+//     filter banks): CAN1's banks (below CAN2SB) and CAN2's (from CAN2SB) each count from 0. CAN2's
+//     numbers continued after CAN1's, and Zephyr's driver dropped every frame CAN2 received
+//     (stm32f4_disco, whose zephyr,canbus is can2: loopback received 0 of 3).
 //
 // Copyright (c) 2010-2025 Antmicro
 // Copyright (c) 2011-2015 Realtime Embedded
@@ -485,22 +489,35 @@ namespace Antmicro.Renode.Peripherals.CAN
 
         public void PrioritizeFiFoFilters(uint fifo)
         {
-            uint firstFilterNumber = 0;
+            // STMCANZephyr (fix 8): filter numbers (FMI) count separately for the banks of
+            // CAN1 (below CAN2SB) and of CAN2 (from CAN2SB), each from 0. They counted across all
+            // banks, so a CAN2 filter at bank 14 + k got CAN1's filter count added to its FMI and
+            // Zephyr (which numbers CAN2's filters from its first bank) found no callback for it.
+            uint firstMasterFilterNumber = 0;
+            uint firstSlaveFilterNumber = 0;
 
             FifoFiltersPrioritized[fifo].Clear();
+            UpdateFilterCANAssignment();
 
             // Enumarate Fifo filters and add to priolist
             for(int i = 0; i < NumberOfFilterBanks; i++)
             {
                 if(FilterBanks[i].FifoAssignment == fifo)
                 {
-                    FilterBanks[i].FirstFilterNumber = firstFilterNumber;
-                    firstFilterNumber += FilterBanks[i].NumberOfFiltersInBank();
+                    if(FilterBanks[i].BelongsToMaster)
+                    {
+                        FilterBanks[i].FirstFilterNumber = firstMasterFilterNumber;
+                        firstMasterFilterNumber += FilterBanks[i].NumberOfFiltersInBank();
+                    }
+                    else
+                    {
+                        FilterBanks[i].FirstFilterNumber = firstSlaveFilterNumber;
+                        firstSlaveFilterNumber += FilterBanks[i].NumberOfFiltersInBank();
+                    }
                     FifoFiltersPrioritized[fifo].Add(FilterBanks[i]);
                 }
             }
 
-            UpdateFilterCANAssignment();
             FifoFiltersPrioritized[fifo].Sort();
         }
 
@@ -640,7 +657,12 @@ namespace Antmicro.Renode.Peripherals.CAN
             // Filter registers
             case RegisterOffset.CAN_FMR:
                 registers.CAN_FMR.SetValue(value);
-                UpdateFilterCANAssignment();
+                // STMCANZephyr (fix 8): a new CAN2SB moves banks between CAN1 and CAN2, so
+                // their filter numbers change too
+                for(uint fifo = 0; fifo < NumberOfRxFifos; fifo++)
+                {
+                    PrioritizeFiFoFilters(fifo);
+                }
                 return;
             case RegisterOffset.CAN_FM1R:
                 if(registers.CAN_FMR.FilterInitMode == true)
