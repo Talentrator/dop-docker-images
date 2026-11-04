@@ -1,0 +1,14 @@
+/*
+ * stm32f072b_disco: devicetree fix applied to every build for this board (zr-scenario and the board
+ * check add it before the task's own overlays).
+ *
+ * The user button B1 (PA0) is active high: pressing it drives PA0 high. Zephyr v4.4's board file says
+ * GPIO_ACTIVE_LOW, which is wrong. Evidence: ST's own board code for this board (32f072bdiscovery-bsp,
+ * BSP_PB_Init) sets PA0 with a pull-down when polled and interrupts on the rising edge (GPIO_MODE_IT_RISING);
+ * ST's schematic MB1076 names B1 "USER & WAKE-UP Button" on PA0/WKUP1, and the STM32F0's WKUP1 wakes on a
+ * rising edge (RM0091, PWR_CSR EWUP1); Renode's board file drives PA0 high on a press. With Zephyr's
+ * polarity, an interrupt on the edge to active fired on release, 50 ms late (board check, 4 Nov).
+ */
+&user_button {
+	gpios = <&gpioa 0 GPIO_ACTIVE_HIGH>;
+};

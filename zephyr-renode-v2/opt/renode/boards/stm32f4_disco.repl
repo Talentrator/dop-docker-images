@@ -11,6 +11,9 @@
 //     file wires each port straight to EXTI, then re-declares the pins with timer functions (PA0,
 //     PD12, ...) for the timers only, which drops their EXTI route: the user button (PA0) never
 //     raised an interrupt. Now EXTICR picks the port for each line, as on the chip.
+//   - ADC1 added (Renode's files have no ADC): the F4's ADC is the same block as the F7's (Zephyr drives
+//     both with st,stm32f4-adc), so Renode's STM32_ADC, as its stm32f777.repl uses and as the board
+//     check passes on nucleo_f767zi. ADC2 and ADC3 are not added.
 //   - SVD read from the image instead of downloaded (the grader box has no network).
 
 fsmcBank1: Memory.MappedMemory @ sysbus 0x60000000
@@ -426,3 +429,6 @@ UserLED: Miscellaneous.LED @ gpioPortD
 gpioPortD:
     12 -> UserLED@0 | syscfg#3@12
    
+
+adc1: Analog.STM32_ADC @ sysbus 0x40012000
+    IRQ -> nvic@18
