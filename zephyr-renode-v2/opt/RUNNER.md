@@ -21,6 +21,16 @@ Rules that hold for all of it:
 - **Board details live in zr-task.json** (platform, console, CAN buses, sensors, pins, ADC inputs,
   extra peripherals), so a scenario names a pin or a sensor and the same scenario shape works on
   another board by changing the task file only.
+- **A board's devicetree fix.** Where Zephyr's board file disagrees with the real board, the image
+  carries a fix next to the board's platform file (`/opt/zephyr-v2/renode/boards/<board>.overlay`, `/`
+  as `_`), and every build for that board applies it before the task's locked overlay and again after
+  the project's own. Today one board has one: stm32f072b_disco, whose user button is active high (Zephyr
+  v4.4 says active low).
+- **Sensor models: use the patched copies** where one exists, each in `/opt/zephyr-v2/renode/` (add it
+  to `includes`): `Sensors.LIS2DW12Fixed` (`LIS2DW12Fixed.cs`: FIFO burst reads, data-ready),
+  `Sensors.AS6221Fixed`, `Sensors.IIS2MDCFixed` and `Sensors.ICP_101xxFixed` (`AS6221Fixed.cs`,
+  `IIS2MDCFixed.cs`, `ICP101xxFixed.cs`: multi-byte reads on I2C controllers that fetch one byte at a
+  time, as stm32f4_disco's and nrf52840dk's do). Each file's header says what changed and why.
 - Every check has a `name` and a `group` (default: the scenario's `group`, else `main`). A group
   scores the share of its checks that pass; the reward is the lowest group; a strict pass needs every
   check. No build: reward 0. A check or event the runner does not know, a pin or sensor the task file

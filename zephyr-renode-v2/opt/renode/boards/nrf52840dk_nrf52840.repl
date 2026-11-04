@@ -5,7 +5,13 @@
 //     GPIO_ACTIVE_LOW with pull-up). Renode's file drove them high, so the pin read pressed at rest
 //     and an edge-to-active interrupt fired on release.
 //   - GPIOTE as NRF52840_GPIOTasksEventsZephyr: the first edge of a pin resting high was lost.
-//   - CPU at 64 MIPS (Renode's file sets none, so 100), one instruction per 64 MHz cycle.
+//   - CPU at 42 MIPS (Renode's file sets none, so 100). Renode times instructions, the chip times cycles.
+//     Zephyr's k_busy_wait on nRF is nrfx's delay loop, calibrated in cycles: 2 instructions take 3
+//     cycles a turn, so at 64 MIPS (one instruction per 64 MHz cycle) every busy wait came out 0.667 of
+//     its length (board check, 4 Nov: 0.650 to 0.675 ms per ms). 64 x 2/3 = 42.7; Renode takes whole
+//     MIPS, and 42 keeps busy waits at least as long as asked (43 would make them 0.8 % short).
+//     Everything else runs at 42 million instructions per simulated second, which is nearer a real
+//     Cortex-M4 at 64 MHz (more than one cycle per instruction on average) than 64 was.
 //   - SVD read from the image instead of downloaded (the grader box has no network).
 
 nvic: IRQControllers.NVIC @ sysbus 0xE000E000
@@ -13,7 +19,7 @@ nvic: IRQControllers.NVIC @ sysbus 0xE000E000
 
 cpu: CPU.CortexM @ sysbus
     cpuType: "cortex-m4"
-    PerformanceInMips: 64
+    PerformanceInMips: 42
     nvic: nvic
 
 uart0: UART.NRF52840_UART @ sysbus 0x40002000
