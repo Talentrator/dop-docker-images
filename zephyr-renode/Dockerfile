@@ -8,6 +8,8 @@
 #   Emulator: Renode 1.17.0 (portable, .NET included), with renode-test
 #             (Robot Framework) for scripted checks
 #   Arches  : linux/arm64 and linux/amd64 (SDK and Renode picked from TARGETARCH)
+#   ML      : TensorFlow Lite Micro with CMSIS-NN and CMSIS-DSP, as west modules
+#             (present, not set up in any project)
 #
 # Build (native): docker build -t zephyr-renode .
 
@@ -21,6 +23,10 @@ ARG RENODE_VERSION=1.17.0
 ARG ZEPHYR_TOOLCHAINS="arm-zephyr-eabi"
 # ../zephyr-qemu-arm's modules, and the HALs of the STM32 and nRF boards
 ARG ZEPHYR_MODULES="cmsis cmsis_6 littlefs mbedtls nanopb picolibc zcbor hal_stm32 hal_nordic"
+# TensorFlow Lite Micro (in Zephyr's "optional" group) and the CMSIS-NN kernels
+# it can use; Zephyr's CMSIS-NN kernel option selects CMSIS-DSP. The tflite-micro
+# python/ folder stays: Zephyr's glue compiles a file from it.
+ARG ZEPHYR_ML_MODULES="cmsis-nn cmsis-dsp tflite-micro"
 # Of hal_stm32's 30 series (1.1 GB), the ones the STM32 boards above are
 ARG STM32_SERIES="f0 f4 f7"
 ARG USERNAME=zephyr
@@ -119,8 +125,9 @@ RUN set -eux; \
     pip install --no-cache-dir --upgrade pip wheel; \
     pip install --no-cache-dir west; \
     west init -m https://github.com/zephyrproject-rtos/zephyr --mr ${ZEPHYR_VERSION} ${ZEPHYR_WORKSPACE}; \
-    FILTER="-.*"; for m in ${ZEPHYR_MODULES}; do FILTER="${FILTER},+${m}"; done; \
+    FILTER="-.*"; for m in ${ZEPHYR_MODULES} ${ZEPHYR_ML_MODULES}; do FILTER="${FILTER},+${m}"; done; \
     west config manifest.project-filter -- "${FILTER}"; \
+    west config manifest.group-filter -- +optional; \
     west update --narrow --fetch-opt=--depth=1; \
     find ${ZEPHYR_WORKSPACE} -name .git -prune -exec rm -rf {} +; \
     mv ${ZEPHYR_BASE}/tests/test_config.yaml /tmp/; \
@@ -159,7 +166,7 @@ COPY --chmod=755 scripts/smoke-test.sh /usr/local/bin/zephyr-smoke-test
 ENV ZEPHYR_VERSION=${ZEPHYR_VERSION} \
     RENODE_VERSION=${RENODE_VERSION}
 LABEL org.opencontainers.image.title="zephyr-renode" \
-      org.opencontainers.image.description="Zephyr ${ZEPHYR_VERSION} + SDK ${ZEPHYR_SDK_VERSION} + Renode ${RENODE_VERSION} for the STM32, nRF52 and Cortex-R8 boards Renode runs"
+      org.opencontainers.image.description="Zephyr ${ZEPHYR_VERSION} + SDK ${ZEPHYR_SDK_VERSION} + Renode ${RENODE_VERSION} for the STM32, nRF52 and Cortex-R8 boards Renode runs, with TensorFlow Lite Micro and CMSIS-NN"
 
 WORKDIR /workdir
 CMD ["/bin/bash"]

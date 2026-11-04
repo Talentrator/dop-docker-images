@@ -1,7 +1,8 @@
 # zephyr-renode Docker image
 
 Zephyr **v4.4.2** + Zephyr SDK **1.0.1** + **Renode 1.17.0** for the boards Renode runs: [`../zephyr-qemu-arm`](../zephyr-qemu-arm)
-with Renode in place of QEMU, and the STM32 and Nordic HALs those boards build against. About **2.6 GB unpacked**.
+with Renode in place of QEMU, the STM32 and Nordic HALs those boards build against, and TensorFlow Lite Micro with
+the CMSIS-NN kernels. About **2.6 GB unpacked**, plus about 0.2 GB for the machine learning modules.
 
 Renode runs in virtual time, so the same image prints the same bytes on every run, and a grader can set a
 sensor's value, watch a GPIO or count instructions from a Robot test (`renode-test`) or a Monitor command.
@@ -29,6 +30,11 @@ it. The others run with `zephyr-renode-run`.
 - The Arm compiler (`arm-zephyr-eabi`), the Zephyr tree with its samples, west and twister.
 - West modules: `cmsis cmsis_6 littlefs mbedtls nanopb picolibc zcbor`, `hal_nordic`, and `hal_stm32` cut to
   the F0, F4 and F7 series (`STM32_SERIES`).
+- Machine learning, as west modules no project uses until it asks: `tflite-micro` (Zephyr's `optional` group,
+  turned on with `manifest.group-filter +optional`), `cmsis-nn` and `cmsis-dsp`, at the revisions Zephyr v4.4.2
+  pins. A project sets `CONFIG_TENSORFLOW_LITE_MICRO=y` (C++, full libc++) and, for the optimised Arm kernels,
+  `CONFIG_TENSORFLOW_LITE_MICRO_CMSIS_NN_KERNELS=y`. On `nucleo_f767zi` a 300 KB int8 person-detection model
+  takes about 11 M cycles a frame with CMSIS-NN and about 330 M with the reference kernels.
 
 Left out, against `../zephyr-qemu-arm`: the SDK host tools (QEMU, OpenOCD; dtc comes from apt).
 
@@ -50,7 +56,7 @@ From this folder:
 
 ```bash
 docker build -t zephyr-renode .
-docker run --rm zephyr-renode zephyr-smoke-test     # hello_world on the five boards, renode-test, twister
+docker run --rm zephyr-renode zephyr-smoke-test     # hello_world on the five boards, renode-test, twister, TFLM
 
 docker run --rm -it -v "$PWD":/workdir zephyr-renode
 west build -b stm32f4_disco $ZEPHYR_BASE/samples/hello_world
