@@ -3,7 +3,7 @@
 `zr-scenario run` (in the box) and `zr-scenario grade` (in the grader, as root) build a Zephyr project
 the same way and run it on Renode against scenarios. This file lists every scenario event and check:
 its JSON, one example, what it reads from the simulated hardware, and its limits. `zr-replay` (the
-step-list replay tool) is described at the end.
+step-list replay tool) and `zr-record` (the author's session recorder) are described at the end.
 
 Rules that hold for all of it:
 
@@ -253,3 +253,72 @@ a model's: a fresh login shell of the task user, `cd <workdir> && <command>`. Ou
 JSONL in DOP's shape (a `model` entry with the `bash` tool call, a `tool` entry with the real output,
 exit code and duration; a closing `submit`), and a report of which expectations held. Exit 0 when
 every call matched. Example: `tests/runner/replay/impact-alert.steps.md`.
+
+## zr-record: recording an author's solution
+
+```
+zr-record [-o recording.jsonl] [--project /workdir/tcu] [--user zephyr] [--force]
+zr-record export recording.jsonl > steps.md
+```
+
+An author solves the task in the task's box (locally, with the published image) and `zr-record` writes
+the session as `recording.jsonl`, the recording form of DOP's steps format, which DOP replays in Verify.
+It is a read-and-run loop, not a hooked shell: each line typed is one command, run as DOP runs a model's
+(a fresh login shell of the task user, `cd <project> && <command>`), so `cd` and variables do not carry
+over, as for the model. Output shows live. A line ending in `\`, a line that leaves a quote open and a
+heredoc (`cat > f <<'EOF'` ... `EOF`) read on. Commands get no stdin and no terminal, so edit in a second
+terminal (`docker exec -it <box> bash`, `vi` is there) or an editor attached to the container.
+
+Lines starting with `#` are not run:
+
+| Line | Writes |
+|---|---|
+| `#why TEXT` | a `note` line: the reasoning for what comes next |
+| `#step TITLE` | a `step` line: what follows, up to the next `#step`, is one step |
+| `#sync` | nothing itself: picks up editor changes now (this also happens at every other line) |
+| `#end` | stops (so does Ctrl-D or the end of input) |
+
+The recording, one JSON object per line (`t`: seconds since the start; a command's `t` is when it
+started):
+
+```
+{"t": 0.0, "type": "command", "command": "zr-scenario run", "output": "...", "exit_code": 0, "seconds": 41.2}
+{"t": 95.4, "type": "file", "path": "src/impact.c", "content": "..."}
+{"t": 96.0, "type": "delete", "path": "src/old.c"}
+{"t": 97.1, "type": "note", "text": "why I did the next part"}
+{"t": 97.1, "type": "step", "title": "Add the impact detector"}
+```
+
+Editor changes: whenever a line is read, and at the end, `zr-record` compares the project's files with
+how it last saw them. A changed text file becomes a `file` line with its whole new content, a removed
+file a `delete` line, in path order, ahead of the line just typed. A file changed by a command is not
+written as a `file` line, since replaying the command makes the same change; the recorder names such
+files on the terminal. So save editor changes before running the next command: a file saved while a
+command runs counts as that command's change. Not compared: `build/` and any folder holding a
+`CMakeCache.txt`, `.git/`, caches, editor swap and backup files, and the recording itself. A binary
+file, a file over 1 MB (`--max-file-bytes`) or a symbolic link that changes outside the loop is not
+recorded: the recorder prints a one-line warning and writes no line, since a `note` is the author's
+reasoning in the trajectory. Verify's fill from the answer key names such a file. Removing a file that
+was made outside the loop and never recorded writes no `delete` line either.
+
+A command interrupted with Ctrl-C is not recorded (a replay would run it to the end); any file it
+changed is recorded as a `file` line instead. A command still running after `--timeout` (900 s, as
+zr-replay) is stopped and recorded with exit code 124. At the end the recorder warns when the
+recording lacks `zr-scenario run` before the first change or after the last: Verify requires both.
+
+`zr-record export` writes the recording as the version 1 step list above, so `zr-replay` replays it
+today: a `step` line starts a step, notes become its text, a command becomes a `sh` block with `expect
+exit <recorded exit code>` (the recorded output is not an expectation), a `file` line a `file=PATH`
+block with its content, a `delete` line `rm -f`. A file a block cannot carry byte for byte (no final
+newline, a line starting with three backticks, the heredoc marker, an unusual path) is written from
+base64 instead. Grouping, which only sets titles and texts: before the first `step` line each command is
+its own step titled by the command, and a run of `file` and `delete` lines is one step ("Edit
+src/impact.c"); a note belongs to the step it was written in while that step has no calls yet,
+otherwise to the step of the next call or `step` line.
+
+Proven by `tests/record/run.sh` (the zephyr-v2 repo): a scripted session in the impact-alert box with
+edits made from outside the loop, every line checked against the format, the export replayed by
+`zr-replay` in a fresh box with every expectation held, and the replayed project graded the same as the
+recorded one (1.0, strict). With `--mutant` it runs a recorder whose editor-change detection is off, which
+the test must catch. Last run (4 Nov, zephyr-renode-v2:p3 with this folder mounted): 17 of 17 checks
+held in 120 s; the mutant failed 9 of 17 (its replayed project graded 0.0).
