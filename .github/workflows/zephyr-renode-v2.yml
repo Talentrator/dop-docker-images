@@ -1,0 +1,35 @@
+# The zephyr-renode-v2 image: zephyr-renode-v2/ in this repo, published as ghcr.io/<owner>/<repo>/zephyr-renode-v2.
+# zephyr-renode (by digest) plus what scored scenario tasks need: the scenario runner, patched Renode
+# models, a platform file per checked board, hal_st and hal_tdk, and the unprivileged build user.
+name: zephyr-renode-v2
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - zephyr-renode-v2/**
+      - .github/workflows/zephyr-renode-v2.yml
+      - .github/workflows/image.yml
+  pull_request:
+    paths:
+      - zephyr-renode-v2/**
+      - .github/workflows/zephyr-renode-v2.yml
+      - .github/workflows/image.yml
+  workflow_dispatch:
+
+concurrency:
+  group: zephyr-renode-v2-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  image:
+    uses: ./.github/workflows/image.yml
+    with:
+      image: zephyr-renode-v2
+      version_arg: ZEPHYR_RENODE_V2_VERSION
+      smoke_test: zephyr-smoke-test
+      description: Zephyr + Renode for scored firmware tasks - scenario runner, patched Renode models, checked boards
