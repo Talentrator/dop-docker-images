@@ -164,6 +164,12 @@ def _copy_regular(src: str, dst: str) -> bool:
     return True
 
 
+def board_overlay(board: str) -> str | None:
+    """The image's devicetree fix for a board, if it has one (renode/boards/<board, / as _>.overlay)."""
+    path = os.path.join(RENODE_DIR, "boards", board.replace("/", "_") + ".overlay")
+    return path if os.path.isfile(path) else None
+
+
 def build(app: str, zone: str, out: str, task: dict, drop_privileges: bool) -> dict:
     """west build of the staged app. Returns {ok, elf, seconds, log}.
 
@@ -175,11 +181,16 @@ def build(app: str, zone: str, out: str, task: dict, drop_privileges: bool) -> d
     build_dir = os.path.join(zone, "build")
     # The locked overlay goes before the project's app.overlay, so the project can refer to the
     # nodes it defines, and again after it, so the project cannot change what it sets.
+    # A board's devicetree fix (boards/<board>.overlay next to its platform file: where Zephyr's board
+    # file disagrees with the real board, e.g. stm32f072b_disco's button polarity) goes first and after
+    # the project's overlay too, like the locked one: every build for the board gets the real hardware.
     locked = os.path.join(task["dir"], "locked.overlay")
-    overlays = [locked] + ([os.path.join(app, "app.overlay")] if os.path.isfile(os.path.join(app, "app.overlay")) else [])
+    board_fix = board_overlay(task["board"])
+    fixed = ([board_fix] if board_fix else []) + [locked]
+    overlays = fixed + ([os.path.join(app, "app.overlay")] if os.path.isfile(os.path.join(app, "app.overlay")) else [])
     argv = ["west", "build", "-p", "always", "-b", task["board"], "-d", build_dir, app, "--",
             f"-DDTC_OVERLAY_FILE={';'.join(overlays)}",
-            f"-DEXTRA_DTC_OVERLAY_FILE={locked}",
+            f"-DEXTRA_DTC_OVERLAY_FILE={';'.join(fixed)}",
             f"-DEXTRA_CONF_FILE={os.path.join(task['dir'], 'locked.conf')}",
             "-DUSE_CCACHE=0"]
     keep = ("PATH", "ZEPHYR_BASE", "ZEPHYR_SDK_INSTALL_DIR", "ZEPHYR_TOOLCHAIN_VARIANT", "VIRTUAL_ENV",

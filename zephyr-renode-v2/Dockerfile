@@ -13,7 +13,7 @@
 # Build: docker build -t zephyr-renode-v2 .   (BASE pins ../zephyr-renode by digest: the 29 Oct build)
 
 # the version tag the publish workflow gives the image
-ARG ZEPHYR_RENODE_V2_VERSION=v2.0.0
+ARG ZEPHYR_RENODE_V2_VERSION=v2.0.1
 ARG BASE=ghcr.io/talentrator/dop-docker-images/zephyr-renode@sha256:33c8bd54608f0a95854abdbfb7924acdf675caf86c9b0e8a060a35b49ef2a2c9
 FROM ${BASE}
 
