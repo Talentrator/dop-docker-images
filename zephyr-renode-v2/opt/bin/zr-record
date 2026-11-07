@@ -1,0 +1,611 @@
+#!/usr/bin/env python3
+"""zr-record: record an author's solution in the task's box as recording.jsonl, the steps format DOP replays.
+
+  zr-record [-o recording.jsonl] [--project /workdir/tcu] [--user zephyr] [--timeout 900] [--force]
+  zr-record export recording.jsonl [-o steps.md]
+
+Recording is a read-and-run loop, not a hooked shell. Each line typed (or fed on stdin) is one command,
+run the way DOP runs a model's command and zr-replay replays it: a fresh login shell of the task's user,
+`cd <project> && <command>` (as root it switches user with `su -`). So `cd` and variables do not carry
+over from one command to the next, as for the model. The output is shown live and the command is
+written as a `command` line with its output, exit code and time. A line ending in a backslash continues
+on the next line, so does a line that leaves a quote open, and a heredoc (`cat > f <<'EOF'`) reads on to
+its end marker. Commands get no stdin and no terminal: edit in an editor outside the loop (a second
+`docker exec -it <box> bash`, or an editor attached to the container).
+
+Edits made outside the loop are picked up by comparing the project's files whenever a line is read (and
+at the end): each changed text file becomes a `file` line with its full new content, each removed file a
+`delete` line. A file changed by a command is not written as a `file` line, since replaying the command
+makes the change again. Not compared: build folders (build/, any folder with a CMakeCache.txt), .git/,
+caches, editor swap files, and the recording itself. A binary file, a file over --max-file-bytes or a
+symbolic link that changes outside the loop is not recorded: zr-record warns on the terminal and writes no
+line (notes are the author's reasoning), and Verify's fill from the answer key names such a file.
+
+Meta lines, not run:
+  #why TEXT     a `note` line: the author's reasoning for what comes next
+  #step TITLE   a `step` line: what follows, up to the next #step, is one step
+  #sync         compare the project's files now (it also happens at every other line)
+  #end          stop (end of input does the same)
+  #help         this list
+
+`zr-record export recording.jsonl` writes the recording as zr-replay's step list (version 1): each file
+line as a file block with its content, each command as a sh block with `expect exit <recorded exit
+code>`, each delete as `rm -f`. `zr-replay steps.md` then replays it in a fresh box.
+
+Recording lines (one JSON object each; `t` is seconds since the recording started):
+  {"t", "type": "command", "command", "output", "exit_code", "seconds"}
+  {"t", "type": "file", "path", "content"}       path relative to the project
+  {"t", "type": "delete", "path"}
+  {"t", "type": "note", "text"}
+  {"t", "type": "step", "title"}
+"""
+from __future__ import annotations
+
+import argparse
+import base64
+import fnmatch
+import hashlib
+import json
+import os
+import re
+import select
+import shlex
+import signal
+import subprocess
+import sys
+import time
+
+SKIP_DIRS = {"build", ".git", ".svn", ".hg", "__pycache__", ".cache", ".ccache", ".pytest_cache",
+             ".mypy_cache", "twister-out", ".venv", "venv", "node_modules", ".vscode", ".idea"}
+SKIP_FILES = (".*.sw?", "*~", ".#*", "#*#", "4913", ".DS_Store")   # editor swap, backup and lock files
+HUGE = 64 << 20                 # files past this are compared by size and times only, never read
+CHECK_COMMAND = "zr-scenario run"
+META = ("why", "step", "sync", "end", "help")
+HELP = ("#why TEXT (a note: why), #step TITLE (start a step), #sync (pick up editor changes now), "
+        "#end (stop); any other line runs as a command")
+
+
+def say(msg: str) -> None:
+    print(f"[zr-record] {msg}", file=sys.stderr, flush=True)
+
+
+# ---------------------------------------------------------------------------------------------------------
+# the project's files
+
+class Snapshot:
+    """path -> (stat key, digest, kind) for every compared file; kind is text, binary, large or link."""
+
+    def __init__(self, root: str, exclude: set[str], max_bytes: int, prev: "Snapshot | None" = None):
+        self.files: dict[str, tuple] = {}
+        self.text: dict[str, str] = {}      # contents of text files read this time (new or changed)
+        old = prev.files if prev else {}
+        for d, dirs, names in os.walk(root):
+            dirs[:] = sorted(x for x in dirs if x not in SKIP_DIRS
+                             and not os.path.isfile(os.path.join(d, x, "CMakeCache.txt")))
+            for n in sorted(names):
+                full = os.path.join(d, n)
+                rel = os.path.relpath(full, root).replace(os.sep, "/")
+                if os.path.realpath(full) in exclude or any(fnmatch.fnmatch(n, p) for p in SKIP_FILES):
+                    continue
+                try:
+                    st = os.lstat(full)
+                    if os.path.islink(full):
+                        self.files[rel] = (None, "link:" + os.readlink(full), "link")
+                        continue
+                    if not os.path.isfile(full):
+                        continue
+                    key = (st.st_size, st.st_mtime_ns, st.st_ctime_ns, st.st_ino)
+                    if rel in old and old[rel][0] == key:     # ctime moves on every write: unchanged
+                        self.files[rel] = old[rel]
+                        continue
+                    if st.st_size > HUGE:
+                        self.files[rel] = (key, f"stat:{key}", "large")
+                        continue
+                    with open(full, "rb") as f:
+                        data = f.read()
+                except OSError:
+                    continue                                  # gone or unreadable between walk and read
+                digest = hashlib.sha256(data).hexdigest()
+                kind = "large" if len(data) > max_bytes else "binary"
+                if kind == "binary" and b"\0" not in data:
+                    try:
+                        self.text[rel] = data.decode("utf-8")
+                        kind = "text"
+                    except UnicodeDecodeError:
+                        pass
+                self.files[rel] = (key, digest, kind)
+
+    def changes(self, new: "Snapshot") -> list[tuple[str, str]]:
+        """(path, what) for each difference, what = changed or deleted, in path order."""
+        out = []
+        for rel in sorted(set(self.files) | set(new.files)):
+            if rel not in new.files:
+                out.append((rel, "deleted"))
+            elif rel not in self.files or self.files[rel][1] != new.files[rel][1]:
+                out.append((rel, "changed"))
+        return out
+
+
+# ---------------------------------------------------------------------------------------------------------
+# reading the author's lines
+
+def scan(line: str) -> tuple[list[tuple[str, bool]], bool]:
+    """The end markers of the heredocs a command opens, in order, as (marker, tabs stripped), and whether
+    it ends inside a quote (then bash reads on, and so does zr-record)."""
+    out: list[tuple[str, bool]] = []
+    i, n, q = 0, len(line), None
+    while i < n:
+        c = line[i]
+        if q == "'":
+            q = None if c == "'" else q
+        elif c == "\\":
+            i += 1
+        elif q == '"':
+            q = None if c == '"' else q
+        elif c in "'\"":
+            q = c
+        elif c == "#" and (i == 0 or line[i - 1] in " \t\n;&|("):
+            break                                             # a comment
+        elif line.startswith("<<", i) and not line.startswith("<<<", i):
+            j = i + 2
+            strip = line.startswith("-", j)
+            j += strip
+            while j < n and line[j] in " \t":
+                j += 1
+            m = re.match(r"""'([^']+)'|"([^"]+)"|\\?([A-Za-z_][A-Za-z0-9_]*)""", line[j:])
+            if m:
+                out.append((m.group(1) or m.group(2) or m.group(3), strip))
+                i = j + m.end()
+                continue
+            i += 1
+        i += 1
+    return out, q is not None
+
+
+class Reader:
+    def __init__(self, interactive: bool, project: str):
+        self.interactive = interactive
+        self.prompt = f"rec {os.path.basename(project.rstrip('/')) or '/'}$ "
+        if interactive:
+            try:
+                import readline  # noqa: F401  (line editing and history for input())
+            except ImportError:
+                pass
+
+    def raw(self, prompt: str) -> str | None:
+        """One line without its newline; None at the end of input."""
+        if self.interactive:
+            try:
+                return input(prompt)
+            except EOFError:
+                print(file=sys.stderr)
+                return None
+        line = sys.stdin.readline()
+        return None if line == "" else line.rstrip("\n").rstrip("\r")
+
+    def entry(self) -> str | None:
+        """The next whole entry: a meta line, or a command with its continuation lines and heredocs.
+        Empty string for a blank line or a cancelled entry."""
+        try:
+            first = self.raw(self.prompt)
+            if first is None:
+                return None
+            if first.lstrip().startswith("#"):
+                return first.strip()
+            lines = [first]
+            while True:
+                markers, open_quote = scan("\n".join(lines))
+                if not (open_quote or _continues(lines[-1])):
+                    break
+                nxt = self.raw("> ")
+                if nxt is None:
+                    say("end of input inside a quote or a continued line: not run")
+                    return None
+                lines.append(nxt)
+            for marker, strip in markers:
+                while True:
+                    nxt = self.raw(f"{marker}> ")
+                    if nxt is None:
+                        say(f"end of input before the heredoc's end marker {marker}: not run")
+                        return None
+                    lines.append(nxt)
+                    if (nxt.lstrip("\t") if strip else nxt) == marker:
+                        break
+            return "\n".join(lines) if first.strip() else ""
+        except KeyboardInterrupt:
+            print(file=sys.stderr)
+            return ""
+
+
+def _continues(line: str) -> bool:
+    """A line ending in an odd number of backslashes continues on the next."""
+    return (len(line) - len(line.rstrip("\\"))) % 2 == 1
+
+
+# ---------------------------------------------------------------------------------------------------------
+# running a command as the model's bash runs it (zr-replay's run(), with the output shown live)
+
+def run_live(command: str, project: str, user: str | None, timeout: float) -> tuple[int, str, float, bool]:
+    """(exit code, output, seconds, interrupted). stdout and stderr together, as they came."""
+    full = f"cd {project} && {command}"
+    argv = ["su", "-", user, "-c", full] if (user and os.geteuid() == 0) else ["bash", "-lc", full]
+    t0 = time.monotonic()
+    p = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                         start_new_session=True)
+    fd, chunks, note, interrupted = p.stdout.fileno(), [], "", False
+    try:
+        while True:
+            left = t0 + timeout - time.monotonic()
+            if left <= 0:
+                _stop(p)
+                note = f"\n(timed out after {timeout:g} s)"
+                break
+            ready, _, _ = select.select([fd], [], [], min(left, 1.0))
+            if ready:
+                data = os.read(fd, 65536)
+                if not data:
+                    break
+                chunks.append(data)
+                sys.stdout.buffer.write(data)
+                sys.stdout.flush()
+    except KeyboardInterrupt:
+        interrupted = True
+        _stop(p)
+    try:
+        rc = p.wait(max(0.1, t0 + timeout - time.monotonic()))
+    except subprocess.TimeoutExpired:                         # it closed its output but kept running
+        _stop(p)
+        rc, note = p.wait(), f"\n(timed out after {timeout:g} s)"
+    p.stdout.close()
+    if note:
+        rc = 124
+        print(note.strip(), flush=True)
+    return rc, b"".join(chunks).decode("utf-8", errors="replace") + note, time.monotonic() - t0, interrupted
+
+
+def _stop(p: subprocess.Popen) -> None:
+    for sig, wait in ((signal.SIGINT, 2.0), (signal.SIGTERM, 2.0), (signal.SIGKILL, 5.0)):
+        try:
+            os.killpg(p.pid, sig)
+        except ProcessLookupError:
+            return
+        try:
+            p.wait(wait)
+            return
+        except subprocess.TimeoutExpired:
+            pass
+
+
+# ---------------------------------------------------------------------------------------------------------
+# the recorder
+
+class Recorder:
+    def __init__(self, a):
+        self.project = os.path.abspath(a.project)
+        self.user = a.user
+        self.timeout = a.timeout
+        self.max_bytes = a.max_file_bytes
+        self.path = os.path.abspath(a.out)
+        self.out = open(self.path, "w", encoding="utf-8")
+        self.exclude = {os.path.realpath(self.path)}
+        self.t0 = time.monotonic()
+        self.base = Snapshot(self.project, self.exclude, self.max_bytes)
+        self.counts = {k: 0 for k in ("command", "file", "delete", "note", "step")}
+        self.changes_seen = False             # a file or delete line, or a command that changed files
+        self.unreplayed: set[str] = set()     # made outside the loop, never recorded: a replay never has them
+        self.check_before = self.check_after = False
+
+    def write(self, type_: str, **fields) -> None:
+        obj = {"t": round(time.monotonic() - self.t0, 2), "type": type_, **fields}
+        self.out.write(json.dumps(obj, ensure_ascii=False) + "\n")
+        self.out.flush()
+        self.counts[type_] += 1
+
+    def sync(self) -> None:
+        """Write a file or delete line for every change made outside the loop since the last look."""
+        new = Snapshot(self.project, self.exclude, self.max_bytes, self.base)
+        for rel, what in self.base.changes(new):
+            self.changes_seen = True
+            self.check_after = False
+            if what == "deleted":
+                if rel in self.unreplayed:            # a replay never made it, so there is nothing to delete
+                    self.unreplayed.discard(rel)
+                    say(f"removed: {rel} (never recorded, so no delete line)")
+                    continue
+                self.write("delete", path=rel)
+                say(f"deleted: {rel}")
+                continue
+            kind = new.files[rel][2]
+            if kind == "text":
+                self.write("file", path=rel, content=new.text[rel])
+                self.unreplayed.discard(rel)
+                say(f"file: {rel}")
+            else:
+                if rel not in self.base.files:
+                    self.unreplayed.add(rel)
+                why = {"link": "a symbolic link", "large": f"over {self.max_bytes} bytes",
+                       "binary": "not UTF-8 text"}[kind]
+                say(f"warning: {rel} changed but is not recorded ({why}); a replay will not make this change "
+                    "(Verify fills such files from the answer key and names them)")
+        self.base = new
+
+    def command(self, command: str) -> None:
+        if not sys.stdin.isatty():
+            print("$ " + command.replace("\n", "\n> "), flush=True)
+        t = round(time.monotonic() - self.t0, 2)
+        rc, out, secs, interrupted = run_live(command, self.project, self.user, self.timeout)
+        if out and not out.endswith("\n"):
+            print(flush=True)
+        if interrupted:
+            say("interrupted: the command is not recorded; any file it changed is recorded as a file line")
+            self.sync()
+            return
+        # Take the new baseline before writing the line: whoever waits for the line (an author, a test)
+        # may edit files at once, and those edits must not count as the command's own.
+        new = Snapshot(self.project, self.exclude, self.max_bytes, self.base)
+        made = self.base.changes(new)
+        self.base = new
+        self.unreplayed -= {r for r, _ in made}      # a replay of the command makes or removes them
+        obj = {"t": t, "type": "command", "command": command, "output": out, "exit_code": rc,
+               "seconds": round(secs, 2)}
+        self.out.write(json.dumps(obj, ensure_ascii=False) + "\n")
+        self.out.flush()
+        self.counts["command"] += 1
+        if command.strip().startswith(CHECK_COMMAND):
+            if not self.changes_seen:
+                self.check_before = True
+            self.check_after = True
+        if made:
+            self.changes_seen = True
+            self.check_after = False
+            say("changed by the command (a replay of it makes the change again): "
+                + ", ".join(f"{r}{' (deleted)' if w == 'deleted' else ''}" for r, w in made))
+        say(f"exit {rc}, {secs:.1f} s")
+
+    def meta(self, line: str) -> bool:
+        """Handle a # line; False at #end."""
+        m = re.match(r"#\s*([A-Za-z]+)\b\s*(.*)$", line, re.S)
+        word, rest = (m.group(1).lower(), m.group(2).strip()) if m else ("", "")
+        if word not in META:
+            say(f"not run: a line starting with # is a meta line. {HELP}")
+            return True
+        if word == "end":
+            return False
+        if word == "help":
+            say(HELP)
+        elif word == "sync":
+            pass                                  # the sync before every line has done it
+        elif not rest:
+            say(f"#{word} needs text after it")
+        elif word == "why":
+            self.write("note", text=rest)
+        else:
+            self.write("step", title=rest)
+        return True
+
+    def close(self) -> None:
+        self.sync()
+        self.out.close()
+        c = self.counts
+        say(f"{sum(c.values())} lines in {self.path}: {c['command']} commands, {c['file']} files, "
+            f"{c['delete']} deletes, {c['note']} notes, {c['step']} steps")
+        if self.changes_seen and not (self.check_before and self.check_after):
+            missing = [w for w, ok in (("before the first change", self.check_before),
+                                       ("after the last change", self.check_after)) if not ok]
+            say(f"Verify needs `{CHECK_COMMAND}` before the first change and after the last; "
+                f"missing here: {' and '.join(missing)}")
+
+
+def cmd_record(a) -> int:
+    if not os.path.isdir(a.project):
+        print(f"zr-record: no project folder {a.project}", file=sys.stderr)
+        return 2
+    if os.path.exists(a.out) and not a.force:
+        print(f"zr-record: {a.out} exists (--force overwrites it)", file=sys.stderr)
+        return 2
+    interactive = sys.stdin.isatty()
+    rec = Recorder(a)
+    reader = Reader(interactive, rec.project)
+    say(f"recording to {rec.path}; each line runs as `cd {rec.project} && <line>` in a fresh login shell")
+    say(HELP)
+    try:
+        while True:
+            entry = reader.entry()
+            if entry is None:
+                break
+            try:
+                rec.sync()
+                if not entry.strip():
+                    continue
+                if entry.startswith("#"):
+                    if not interactive:
+                        print(entry, flush=True)
+                    if not rec.meta(entry):
+                        break
+                    continue
+                rec.command(entry)
+            except KeyboardInterrupt:
+                print(file=sys.stderr)
+    finally:
+        rec.close()
+    return 0
+
+
+# ---------------------------------------------------------------------------------------------------------
+# export: the recording as zr-replay's step list (version 1)
+
+FIELDS = {"command": {"command": str, "output": str, "exit_code": int, "seconds": (int, float)},
+          "file": {"path": str, "content": str}, "delete": {"path": str},
+          "note": {"text": str}, "step": {"title": str}}
+LANG = {".c": "c", ".h": "c", ".cpp": "cpp", ".cc": "cpp", ".hpp": "cpp", ".py": "python", ".overlay": "dts",
+        ".dts": "dts", ".dtsi": "dts", ".conf": "conf", ".cmake": "cmake", ".txt": "text", ".json": "json",
+        ".yaml": "yaml", ".yml": "yaml", ".md": "markdown", ".sh": "bash", ".ld": "ld", ".s": "asm", ".S": "asm"}
+SAFE_PATH = re.compile(r"^[A-Za-z0-9_.+/-]+$")
+LINE_BREAKS = set("\r\x0b\x0c\x1c\x1d\x1e\x85  ")   # str.splitlines() breaks on these too
+HEREDOC_END = "ZR_EOF"
+EXPECT_LIKE = re.compile(r"^\s*[-*]?\s*expect\s+(exit|line:|no line:)", re.IGNORECASE)
+
+
+def load(path: str) -> list[dict]:
+    lines = []
+    with open(path, encoding="utf-8") as f:
+        for n, raw in enumerate(f, 1):
+            if not raw.strip():
+                continue
+            try:
+                obj = json.loads(raw)
+            except json.JSONDecodeError as e:
+                raise ValueError(f"{path}:{n}: not JSON ({e})")
+            want = FIELDS.get(obj.get("type")) if isinstance(obj, dict) else None
+            if want is None:
+                raise ValueError(f"{path}:{n}: unknown line type {obj.get('type') if isinstance(obj, dict) else obj!r}")
+            for k, typ in want.items():
+                if not isinstance(obj.get(k), typ) or isinstance(obj.get(k), bool):
+                    raise ValueError(f"{path}:{n}: a {obj['type']} line needs {k}")
+            lines.append(obj)
+    return lines
+
+
+def group(lines: list[dict]) -> list[dict]:
+    """Steps [{title, why: [...], calls: [...], explicit}]. Before the first step line each command is its
+    own step, titled by the command, and a run of file and delete lines is one step. A note belongs to the
+    step it was written in when that step has no calls yet, otherwise to the step of the next call or
+    step line ("why I did the next part")."""
+    steps: list[dict] = []
+    pending: list[str] = []
+
+    def new(title: str | None, explicit: bool, kind: str) -> dict:
+        s = {"title": title, "why": pending[:], "calls": [], "explicit": explicit, "kind": kind}
+        pending.clear()
+        steps.append(s)
+        return s
+
+    for ln in lines:
+        cur = steps[-1] if steps else None
+        typ = ln["type"]
+        if typ == "step":
+            new(ln["title"], True, "step")
+        elif typ == "note":
+            if cur is not None and cur["explicit"] and not cur["calls"]:
+                cur["why"].append(ln["text"])
+            else:
+                pending.append(ln["text"])
+        else:
+            if cur is not None and cur["explicit"]:
+                s = cur
+            elif typ == "command":
+                s = new(None, False, "command")
+            elif cur is not None and cur["kind"] == "edit":
+                s = cur
+            else:
+                s = new(None, False, "edit")
+            s["why"] += pending
+            pending.clear()
+            s["calls"].append(ln)
+    if pending:
+        (steps[-1]["why"] if steps else new("Notes", True, "step")["why"]).extend(pending)
+    for s in steps:
+        if s["title"] is None and s["kind"] == "command":
+            first = s["calls"][0]["command"].strip().splitlines()[0]
+            s["title"] = first if len(first) <= 80 else first[:77] + "..."
+        elif s["title"] is None:
+            paths = [c["path"] for c in s["calls"]]
+            verb = "Delete" if all(c["type"] == "delete" for c in s["calls"]) else "Edit"
+            s["title"] = f"{verb} {', '.join(paths[:3])}" + (f" and {len(paths) - 3} more" if len(paths) > 3 else "")
+    return steps
+
+
+def _safe_text(text: str) -> str:
+    """Note text that zr-replay reads as text: no line may start a step, a block or an expectation."""
+    out = []
+    for line in text.splitlines():
+        out.append("\\" + line if line.startswith(("## ", "```")) or EXPECT_LIKE.match(line) else line)
+    return "\n".join(out)
+
+
+def _block_ok(text: str) -> bool:
+    return not any(l.startswith("```") for l in text.split("\n")) and not (set(text) & LINE_BREAKS)
+
+
+def render(steps: list[dict], source: str) -> tuple[str, list[str]]:
+    out = [f"# Steps exported by zr-record from {source} (zr-replay step list, version 1)", ""]
+    warnings = []
+    for s in steps:
+        out.append("## " + " ".join(s["title"].split()))
+        why = _safe_text("\n".join(s["why"]).strip())
+        if why:
+            out.append(why)
+        out.append("")
+        for c in s["calls"]:
+            if c["type"] == "command":
+                cmd = c["command"].strip()
+                if not _block_ok(cmd):
+                    b64 = base64.b64encode(cmd.encode()).decode()
+                    cmd = f"eval \"$(echo {b64} | base64 -d)\""
+                    warnings.append(f"a command with a line zr-replay cannot hold in a block runs from base64")
+                out += ["```sh", cmd, "```", f"- expect exit {c['exit_code']}", ""]
+            elif c["type"] == "delete":
+                out += ["```sh", f"rm -f -- {shlex.quote(c['path'])}", "```", ""]
+            else:
+                path, content = c["path"], c["content"]
+                if (SAFE_PATH.match(path) and content.endswith("\n") and HEREDOC_END not in content
+                        and _block_ok(content)):
+                    lang = LANG.get(os.path.splitext(path)[1], "cmake" if path.endswith("CMakeLists.txt") else "text")
+                    out += [f"```{lang} file={path}", content[:-1], "```", ""]   # zr-replay adds the last newline
+                else:
+                    # a file block cannot carry it byte for byte (no final newline, a ``` line, the heredoc
+                    # marker, an odd path): the file is written from base64 instead
+                    b64 = base64.encodebytes(content.encode()).decode().rstrip("\n")
+                    q = shlex.quote(path)
+                    out += ["```sh", f"mkdir -p \"$(dirname {q})\" && base64 -d > {q} <<'{HEREDOC_END}'",
+                            b64, HEREDOC_END, "```", ""]
+                    warnings.append(f"{path}: written from base64 (a file block cannot hold it exactly)")
+    return "\n".join(out).rstrip("\n") + "\n", warnings
+
+
+def cmd_export(a) -> int:
+    try:
+        lines = load(a.recording)
+    except (OSError, ValueError) as e:
+        print(f"zr-record export: {e}", file=sys.stderr)
+        return 2
+    steps = group(lines)
+    text, warnings = render(steps, os.path.basename(a.recording))
+    for w in warnings:
+        print(f"zr-record export: {w}", file=sys.stderr)
+    if not any(s["calls"] for s in steps):
+        print("zr-record export: the recording has no commands or files; zr-replay will refuse it", file=sys.stderr)
+    if a.out:
+        with open(a.out, "w", encoding="utf-8") as f:
+            f.write(text)
+    else:
+        sys.stdout.write(text)
+    calls = sum(len(s["calls"]) for s in steps)
+    print(f"zr-record export: {len(steps)} steps, {calls} calls", file=sys.stderr)
+    return 0
+
+
+def main() -> int:
+    if len(sys.argv) > 1 and sys.argv[1] == "export":
+        p = argparse.ArgumentParser(prog="zr-record export",
+                                    description="Write a recording as zr-replay's step list (version 1).")
+        p.add_argument("recording")
+        p.add_argument("-o", "--out", help="write here instead of stdout")
+        return cmd_export(p.parse_args(sys.argv[2:]))
+    p = argparse.ArgumentParser(prog="zr-record", description=__doc__.split("\n\n")[0],
+                                epilog="zr-record export RECORDING [-o steps.md]: the recording as a step list "
+                                       "zr-replay replays.")
+    p.add_argument("-o", "--out", default="recording.jsonl", help="the recording (default: ./recording.jsonl)")
+    p.add_argument("--project", "--workdir", dest="project", default=os.environ.get("ZR_PROJECT", "/workdir/tcu"),
+                   help="the project folder commands run in and files are compared in (default: $ZR_PROJECT "
+                        "or /workdir/tcu)")
+    p.add_argument("--user", default="zephyr", help="the task's agent user (used when run as root)")
+    p.add_argument("--timeout", type=float, default=900.0, help="per command, seconds (as zr-replay)")
+    p.add_argument("--max-file-bytes", type=int, default=1_000_000,
+                   help="a changed file larger than this is not recorded (a warning says so)")
+    p.add_argument("--force", action="store_true", help="overwrite an existing recording")
+    return cmd_record(p.parse_args())
+
+
+if __name__ == "__main__":
+    sys.exit(main())
