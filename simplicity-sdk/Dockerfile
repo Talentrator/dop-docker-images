@@ -21,10 +21,13 @@
 #
 # Build (native): docker build -t simplicity-sdk .
 
+# Declared once, before any stage: the publish workflow reads the version tag from this line
+ARG SISDK_VERSION=2026.6.2
+
 FROM ubuntu:24.04 AS fetch
 
 ARG TARGETARCH
-ARG SISDK_VERSION=2026.6.2
+ARG SISDK_VERSION
 
 # the SDK has non-ASCII file names, which bsdtar refuses in the C locale
 ENV LANG=C.UTF-8 LC_ALL=C.UTF-8
@@ -92,7 +95,7 @@ RUN set -eux; \
 # ---------------------------------------------------------------------------
 FROM ubuntu:24.04
 
-ARG SISDK_VERSION=2026.6.2
+ARG SISDK_VERSION
 
 ENV DEBIAN_FRONTEND=noninteractive \
     LANG=C.UTF-8 \
