@@ -1,0 +1,33 @@
+# The simplicity-sdk image: simplicity-sdk/ in this repo, published as ghcr.io/<owner>/<repo>/simplicity-sdk.
+name: simplicity-sdk
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - simplicity-sdk/**
+      - .github/workflows/simplicity-sdk.yml
+      - .github/workflows/image.yml
+  pull_request:
+    paths:
+      - simplicity-sdk/**
+      - .github/workflows/simplicity-sdk.yml
+      - .github/workflows/image.yml
+  workflow_dispatch:
+
+concurrency:
+  group: simplicity-sdk-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  image:
+    uses: ./.github/workflows/image.yml
+    with:
+      image: simplicity-sdk
+      version_arg: SISDK_VERSION
+      smoke_test: sisdk-smoke-test
+      description: Silicon Labs Simplicity SDK 2026.6.2 + slc-cli + GCC 14.2.Rel1 for EFR32 Series 2 (xG24 Dev Kit)
