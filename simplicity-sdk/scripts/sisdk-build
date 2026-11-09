@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+# sisdk-build: generate and build a Simplicity SDK project for one board.
+#
+#   sisdk-build [-b BOARD] [-o OUT_DIR] PROJECT [slc generate options ...]
+#
+# PROJECT is a .slcp file or the folder that holds one. The project is copied
+# to a fresh build folder and generated there with slc (CMake output, GCC), so
+# the sources are never written to. The image (.out, .hex, .s37, .bin, .map)
+# ends up in OUT_DIR. Extra arguments go to `slc generate`, for example
+# --with iostream_usart:vcom or --configuration SL_FOO:1.
+#
+# Defaults: BOARD=brd2601b (xG24 Dev Kit), OUT_DIR=./build/<board>.
+set -euo pipefail
+
+board=${SISDK_BOARD:-brd2601b}
+out=""
+while getopts "b:o:h" opt; do
+  case $opt in
+    b) board=$OPTARG ;;
+    o) out=$OPTARG ;;
+    h) sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) exit 2 ;;
+  esac
+done
+shift $((OPTIND - 1))
+[ $# -ge 1 ] || { echo "usage: sisdk-build [-b BOARD] [-o OUT_DIR] PROJECT [slc options ...]" >&2; exit 2; }
+
+project=$1; shift
+if [ -d "$project" ]; then
+  slcps=("$project"/*.slcp)
+  [ ${#slcps[@]} -eq 1 ] && [ -f "${slcps[0]}" ] || { echo "sisdk-build: want exactly one .slcp in $project" >&2; exit 2; }
+  project=${slcps[0]}
+fi
+[ -f "$project" ] || { echo "sisdk-build: no project $project" >&2; exit 2; }
+project=$(realpath "$project")
+name=$(basename "$project" .slcp)
+out=$(realpath -m "${out:-build/$board}")
+
+work=$(mktemp -d "/tmp/sisdk-$name-XXXX")
+trap 'rm -rf "$work"' EXIT
+
+echo "==> slc generate $name for $board"
+# --tt trusts the SDK on every run, so any user can build without a prior
+# `slc signature trust`; the Python adapter pack runs the SDK's generators
+slc generate -p "$project" -d "$work/project" -np -cpproj -o cmake --tt \
+  --with "$board" -s "$SISDK" --toolchain toolchain_gcc \
+  --toolchain-locations="gcc:$ARM_GCC_DIR" --tool-path=/opt/silabs/python "$@"
+
+echo "==> cmake build"
+# NINJA_EXE_PATH: the SDK's bundled ninja is x86_64 only. POST_BUILD_EXE: the
+# SDK's post-build step needs Simplicity Commander, which this image has not;
+# .hex, .s37 and .bin come from objcopy anyway.
+(cd "$work/project/cmake_gcc" \
+  && NINJA_EXE_PATH=$(command -v ninja) POST_BUILD_EXE=$(command -v true) cmake --workflow --preset project)
+
+mkdir -p "$out"
+built=$(find "$work/project/cmake_gcc/build" -name '*.out' -print -quit)
+[ -n "$built" ] || { echo "sisdk-build: the build made no .out" >&2; exit 1; }
+for ext in out hex s37 bin map; do
+  f="${built%.out}.$ext"
+  [ -f "$f" ] && cp "$f" "$out/"
+done
+echo "==> $out"
+arm-none-eabi-size "$out/$(basename "$built")"
