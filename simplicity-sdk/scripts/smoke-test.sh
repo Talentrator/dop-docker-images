@@ -2,7 +2,7 @@
 # Builds three SDK samples for the xG24 Dev Kit with sisdk-build: a bare-metal
 # VCOM echo (the platform), Bluetooth SoC Empty (the Bluetooth stack's
 # prebuilt LTO libraries, which only a zstd-capable GCC links) and the AppLoader
-# bootloader.
+# bootloader, and the VCOM echo once more with a Python venv active.
 # Usage: sisdk-smoke-test [board]
 set -uo pipefail
 
@@ -23,6 +23,11 @@ build() {   # build NAME SLCP
 build iostream "$SISDK/platform_sample_app/app/common/example/iostream_usart_baremetal/iostream_usart_baremetal.slcp"
 build bt_soc_empty "$SISDK/bluetooth_le_app/example/bt_soc_empty/bt_soc_empty.slcp"
 build bootloader "$SISDK/bluetooth_le_app/bootloader/bootloader-apploader.slcp"
+
+# again with a Python venv first on PATH, as a grader's pytest venv is: slc's
+# generators once failed under one ("No module named 'jinja2'")
+python3 -m venv "$OUT/venv"
+PATH="$OUT/venv/bin:$PATH" build iostream_in_venv "$SISDK/platform_sample_app/app/common/example/iostream_usart_baremetal/iostream_usart_baremetal.slcp"
 
 echo
 echo "PASS (${#pass[@]}): ${pass[*]}"

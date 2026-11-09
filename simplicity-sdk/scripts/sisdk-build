@@ -41,7 +41,10 @@ trap 'rm -rf "$work"' EXIT
 
 echo "==> slc generate $name for $board"
 # --tt trusts the SDK on every run, so any user can build without a prior
-# `slc signature trust`; the Python adapter pack runs the SDK's generators
+# `slc signature trust`. With a Python venv first on PATH (a grader's pytest
+# one, say), slc's Jinja generators fail with "No module named 'jinja2'"; the
+# adapter pack's Python first, which has it, keeps them working.
+PATH="/opt/silabs/python/bin:$PATH" \
 slc generate -p "$project" -d "$work/project" -np -cpproj -o cmake --tt \
   --with "$board" -s "$SISDK" --toolchain toolchain_gcc \
   --toolchain-locations="gcc:$ARM_GCC_DIR" --tool-path=/opt/silabs/python "$@"

@@ -105,9 +105,10 @@ ENV DEBIAN_FRONTEND=noninteractive \
     ARM_GCC_DIR=/opt/silabs/gcc \
     PATH=/opt/silabs/gcc/bin:/opt/silabs/java21/jre/bin:$PATH
 
-# CMake and Ninja for the generated projects, poppler-utils for datasheet PDFs
+# CMake and Ninja for the generated projects, python3-venv for a venv of your
+# own (sisdk-build works with one active), poppler-utils for datasheet PDFs
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates git make cmake ninja-build python3 poppler-utils \
+        ca-certificates git make cmake ninja-build python3 python3-venv poppler-utils \
         less vim-tiny file xxd \
     && rm -rf /var/lib/apt/lists/*
 
