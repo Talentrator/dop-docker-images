@@ -13,7 +13,7 @@ building EFR32 Series 2 firmware headless: the agent box and the grader box of a
 | Python adapter pack (runs the SDK's generators: GATT, …) | 3.10 | 451 MB | Simplicity Studio update site |
 | Java (runs slc) | 21.0.6 | 126 MB | Simplicity Studio update site |
 | slc-cli | 6.0.22 | 97 MB | Simplicity Studio update site |
-| Ubuntu 24.04 + CMake, Ninja, make, git, python3, poppler-utils | 24.04 | 344 MB | apt |
+| Ubuntu 24.04 + CMake, Ninja, make, git, python3, python3-venv, poppler-utils | 24.04 | 344 MB | apt |
 | `sisdk-build`, `sisdk-smoke-test` | | | this folder's `scripts/` |
 
 Of the SDK, what a BG24/MG24 firmware task uses:
@@ -72,7 +72,8 @@ sisdk-build /workdir/app                     # -> /workdir/build/brd2601b/iostre
 The kit's serial port (VCOM, 115200 8N1) is USART0 through the board controller: the
 `iostream_usart` component with the `vcom` instance.
 
-To run slc yourself: `slc generate ... --tt --tool-path=/opt/silabs/python --toolchain-locations=gcc:$ARM_GCC_DIR`,
+To run slc yourself: `PATH=/opt/silabs/python/bin:$PATH slc generate ... --tt --tool-path=/opt/silabs/python --toolchain-locations=gcc:$ARM_GCC_DIR`
+(with a Python venv first on PATH, slc's Jinja generators fail with "No module named 'jinja2'"),
 and build with `NINJA_EXE_PATH=$(command -v ninja) POST_BUILD_EXE=$(command -v true) cmake --workflow --preset project`
 in the generated `cmake_gcc/`. The SDK's own `ninja` is x86_64 only, and its post-build step wants Commander.
 
