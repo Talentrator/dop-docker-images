@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+# stm32h5-build: build an STM32CubeH5 project for the NUCLEO-H503RB (STM32H503RB).
+#
+#   stm32h5-build [-o OUT_DIR] [-t BUILD_TYPE] PROJECT [cmake -D options ...]
+#
+# PROJECT is a folder. With a CMakeLists.txt, that is built (it uses
+# stm32h5_firmware() from $STM32H5_CMAKE/stm32h5.cmake; see that file). Without
+# one, the folder is taken as an STM32CubeIDE-style example (Src/ or Core/Src/,
+# Inc/ or Core/Inc/, a *_FLASH.ld, an optional startup_*.s), as in
+# $STM32CUBEH5/Projects/NUCLEO-H503RB, and built as it is.
+#
+# The project is copied to a fresh build folder, so the sources are never
+# written to. NAME.elf, .hex, .bin and .map end up in OUT_DIR. Extra arguments
+# go to cmake's configure step.
+#
+# Defaults: OUT_DIR=./build, BUILD_TYPE=Release (-Os -g; Debug is -Og -g3).
+set -euo pipefail
+
+out=""
+btype=Release
+while getopts "o:t:h" opt; do
+  case $opt in
+    o) out=$OPTARG ;;
+    t) btype=$OPTARG ;;
+    h) sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) exit 2 ;;
+  esac
+done
+shift $((OPTIND - 1))
+[ $# -ge 1 ] || { echo "usage: stm32h5-build [-o OUT_DIR] [-t BUILD_TYPE] PROJECT [cmake options ...]" >&2; exit 2; }
+
+project=$1; shift
+[ -d "$project" ] || { echo "stm32h5-build: $project is not a folder" >&2; exit 2; }
+project=$(realpath "$project")
+out=$(realpath -m "${out:-build}")
+
+work=$(mktemp -d "/tmp/stm32h5-$(basename "$project")-XXXX")
+trap 'rm -rf "$work"' EXIT
+# without the build output, EWARM/MDK-ARM projects or a .git of the project
+(cd "$project" && tar --exclude=./build --exclude=./EWARM --exclude=./MDK-ARM --exclude=./.git -cf - .) | tar -xf - -C "$work"
+mkdir -p "$work/.build"
+
+if [ ! -f "$work/CMakeLists.txt" ]; then
+  # an STM32CubeIDE-style example: list its sources and pick its options
+  name=$(basename "$project" | tr -c 'A-Za-z0-9_\n' '_')
+  cd "$work"
+  mapfile -t srcs < <(find . -path ./.build -prune -o -type f \( -name '*.c' -o -name '*.cpp' -o -name '*.s' -o -name '*.S' \) -print | sed 's|^\./||' | sort)
+  [ ${#srcs[@]} -gt 0 ] || { echo "stm32h5-build: no CMakeLists.txt and no sources in $project" >&2; exit 2; }
+  mapfile -t incs < <(find . -path ./.build -prune -o -type f -name '*.h' -printf '%h\n' | sed 's|^\./||' | sort -u)
+  ld=$(find . -path ./.build -prune -o -type f -name '*_FLASH.ld' -print -quit)
+  opts=""
+  grep -qsE '#include *[<"](tx_api|app_threadx|app_azure_rtos)\.h' "${srcs[@]}" $(printf '%s/*.h ' "${incs[@]}") 2>/dev/null && opts="$opts THREADX"
+  grep -qsE '#include *[<"]cmsis_os2?\.h' "${srcs[@]}" $(printf '%s/*.h ' "${incs[@]}") 2>/dev/null && opts="$opts CMSIS_RTOS2"
+  grep -qsE '#include *[<"]stm32h5xx_nucleo\.h' "${srcs[@]}" $(printf '%s/*.h ' "${incs[@]}") 2>/dev/null && opts="$opts BSP"
+  grep -qsE '#include *[<"]stm32h5xx_ll_' "${srcs[@]}" $(printf '%s/*.h ' "${incs[@]}") 2>/dev/null && opts="$opts LL"
+  {
+    echo "cmake_minimum_required(VERSION 3.22)"
+    echo "project($name C CXX ASM)"
+    echo "include(\$ENV{STM32H5_CMAKE}/stm32h5.cmake)"
+    echo "stm32h5_firmware($name$opts"
+    echo "  SOURCES ${srcs[*]}"
+    [ ${#incs[@]} -gt 0 ] && echo "  INCLUDES ${incs[*]}"
+    [ -n "$ld" ] && echo "  LINKER_SCRIPT ${ld#./}"
+    echo ")"
+  } > CMakeLists.txt
+  echo "==> no CMakeLists.txt: building it as an STM32CubeIDE example (options:${opts:- none})"
+fi
+
+echo "==> cmake configure ($btype)"
+cmake -G Ninja -S "$work" -B "$work/.build" \
+  -DCMAKE_TOOLCHAIN_FILE="$STM32H5_CMAKE/arm-none-eabi.cmake" \
+  -DCMAKE_BUILD_TYPE="$btype" "$@" > "$work/.configure.log" 2>&1 \
+  || { cat "$work/.configure.log"; echo "stm32h5-build: cmake configure failed" >&2; exit 1; }
+echo "==> cmake build"
+cmake --build "$work/.build"
+
+mkdir -p "$out"
+mapfile -t elfs < <(find "$work/.build" -maxdepth 1 -name '*.elf')
+[ ${#elfs[@]} -gt 0 ] || { echo "stm32h5-build: the build made no .elf" >&2; exit 1; }
+for elf in "${elfs[@]}"; do
+  for ext in elf hex bin map; do
+    f="${elf%.elf}.$ext"
+    [ -f "$f" ] && cp "$f" "$out/"
+  done
+done
+echo "==> $out"
+ls -l "$out"

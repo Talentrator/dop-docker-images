@@ -1,0 +1,33 @@
+# The stm32cube-h5 image: stm32cube-h5/ in this repo, published as ghcr.io/<owner>/<repo>/stm32cube-h5.
+name: stm32cube-h5
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - stm32cube-h5/**
+      - .github/workflows/stm32cube-h5.yml
+      - .github/workflows/image.yml
+  pull_request:
+    paths:
+      - stm32cube-h5/**
+      - .github/workflows/stm32cube-h5.yml
+      - .github/workflows/image.yml
+  workflow_dispatch:
+
+concurrency:
+  group: stm32cube-h5-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  image:
+    uses: ./.github/workflows/image.yml
+    with:
+      image: stm32cube-h5
+      version_arg: STM32CUBEH5_VERSION
+      smoke_test: stm32h5-smoke-test
+      description: STM32CubeH5 1.7.0 + Arm GNU Toolchain 14.3.Rel1 + CMake for the NUCLEO-H503RB (STM32H503)
