@@ -1,0 +1,93 @@
+#!/usr/bin/env bash
+# unoq-build: compile an Arduino sketch for the Arduino UNO Q's STM32U585.
+#
+#   unoq-build [-o OUT_DIR] SKETCH [arduino-cli compile options ...]
+#
+# SKETCH is a sketch folder (holding <folder name>.ino) or the .ino itself.
+# The sketch is copied to a fresh folder and compiled there with arduino-cli
+# for arduino:zephyr:unoq, so the sketch folder is never written to. OUT_DIR
+# gets:
+#   <name>.hex          the whole flash image: the core's Zephyr loader at
+#                       0x08000000 and the sketch at its slot; flash this one
+#   <name>.sketch.bin   the sketch alone, as the core's own upload writes it
+#   <name>.elf, .map    the sketch's ELF and link map
+# Extra arguments go to `arduino-cli compile` (--build-property, -v, ...).
+#
+# Defaults: OUT_DIR=./build/unoq.
+set -euo pipefail
+
+fqbn=${UNOQ_FQBN:-arduino:zephyr:unoq}
+out=""
+while getopts "o:h" opt; do
+  case $opt in
+    o) out=$OPTARG ;;
+    h) sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) exit 2 ;;
+  esac
+done
+shift $((OPTIND - 1))
+[ $# -ge 1 ] || { echo "usage: unoq-build [-o OUT_DIR] SKETCH [arduino-cli compile options ...]" >&2; exit 2; }
+
+sketch=$1; shift
+[ -f "$sketch" ] && sketch=$(dirname "$sketch")
+[ -d "$sketch" ] || { echo "unoq-build: no sketch folder $sketch" >&2; exit 2; }
+sketch=$(realpath "$sketch")
+name=$(basename "$sketch")
+[ -f "$sketch/$name.ino" ] || { echo "unoq-build: $sketch has no $name.ino (a sketch's main file is named after its folder)" >&2; exit 2; }
+out=$(realpath -m "${out:-build/unoq}")
+
+work=$(mktemp -d "/tmp/unoq-$name-XXXX")
+trap 'rm -rf "$work"' EXIT
+mkdir -p "$work/$name"
+cp -r "$sketch/." "$work/$name/"
+rm -rf "$work/$name/build"
+
+echo "==> arduino-cli compile $name for $fqbn"
+arduino-cli compile --fqbn "$fqbn" --build-path "$work/build" --output-dir "$work/out" \
+  --warnings default "$@" "$work/$name"
+
+# the sketch image the core's own upload writes (upload.extension: .elf-zsk.bin when
+# dynamically linked, the default), its slot, and the loader, from the board definition
+props=$(arduino-cli board details -b "$fqbn" --show-properties=expanded)
+ext=$(sed -n 's/^upload\.extension=//p' <<<"$props")
+bin="$work/out/$name.ino.$ext"
+[ -n "$ext" ] && [ -f "$bin" ] || { echo "unoq-build: the build made no sketch image ($name.ino.$ext)" >&2; ls "$work/out" >&2; exit 1; }
+addr=$(sed -n 's/^upload\.address=//p' <<<"$props")
+platform=$(sed -n 's/^runtime\.platform\.path=//p' <<<"$props")
+variant=$(sed -n 's/^build\.variant=//p' <<<"$props")
+loader="$platform/firmwares/zephyr-$variant.hex"
+[ -n "$addr" ] && [ -f "$loader" ] || { echo "unoq-build: no upload.address or loader ($addr, $loader)" >&2; exit 1; }
+
+mkdir -p "$out"
+rm -f "$out/$name".{hex,sketch.bin,elf,map}
+cp "$bin" "$out/$name.sketch.bin"
+for ext in elf map; do
+  f=$(find "$work/out" "$work/build" -maxdepth 1 -name "$name.ino.$ext" -print -quit)
+  [ -n "$f" ] && cp "$f" "$out/$name.$ext"
+done
+
+python3 - "$loader" "$bin" "$addr" "$out/$name.hex" <<'PY'
+import sys
+loader, sketch, addr, dst = sys.argv[1], sys.argv[2], int(sys.argv[3], 0), sys.argv[4]
+
+def rec(t, a, data):
+    b = [len(data), (a >> 8) & 0xFF, a & 0xFF, t, *data]
+    return ":" + "".join(f"{x:02X}" for x in b) + f"{(-sum(b)) & 0xFF:02X}"
+
+# the loader's records up to its end-of-file record (and not its start address:
+# the chip boots the loader from its vector table)
+lines = [l.strip() for l in open(loader) if l.strip()]
+body = [l for l in lines if l[7:9] not in ("01", "03", "05")]
+data = open(sketch, "rb").read()
+last_upper = None
+for off in range(0, len(data), 16):
+    a = addr + off
+    if a >> 16 != last_upper:
+        last_upper = a >> 16
+        body.append(rec(4, 0, [last_upper >> 8, last_upper & 0xFF]))
+    body.append(rec(0, a & 0xFFFF, list(data[off:off + 16])))
+body.append(":00000001FF")
+open(dst, "w").write("\n".join(body) + "\n")
+print(f"==> {dst}: loader + {len(data)} byte sketch at {addr:#x}")
+PY
+ls -l "$out"
