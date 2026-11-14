@@ -13,6 +13,7 @@ published to GHCR as `ghcr.io/talentrator/dop-docker-images/<folder>`.
 | [`simplicity-sdk`](simplicity-sdk) | Silicon Labs Simplicity SDK 2026.6.2 + slc-cli + GCC 14.2.Rel1 for EFR32 Series 2 (xG24 Dev Kit) | ~4.1 GB |
 | [`stm32cube-h5`](stm32cube-h5) | STM32CubeH5 1.7.0 + Arm GNU Toolchain 14.3.Rel1 + CMake for the NUCLEO-H503RB (STM32H503), with `stm32h5-build` | ~1 GB |
 | [`arduino-unoq`](arduino-unoq) | arduino-cli 1.6.0 + arduino:zephyr 0.55.0 + ArduinoGraphics 1.1.5 for the Arduino UNO Q (STM32U585), with `unoq-build` | ~1.4 GB |
+| [`esp-idf-esp32s3`](esp-idf-esp32s3) | ESP-IDF v5.5.6 + xtensa-esp-elf GCC 14.2 for the ESP32-S3 (Adafruit Feather ESP32-S3 Reverse TFT), with `esp32s3-build` | ~2.0 GB |
 
 For DOP, always use the pinned digest a workflow run prints in its summary, not a tag:
 `ghcr.io/talentrator/dop-docker-images/<image>@sha256:<digest>`.
