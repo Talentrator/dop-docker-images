@@ -1,0 +1,33 @@
+# The arduino-unoq image: arduino-unoq/ in this repo, published as ghcr.io/<owner>/<repo>/arduino-unoq.
+name: arduino-unoq
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - arduino-unoq/**
+      - .github/workflows/arduino-unoq.yml
+      - .github/workflows/image.yml
+  pull_request:
+    paths:
+      - arduino-unoq/**
+      - .github/workflows/arduino-unoq.yml
+      - .github/workflows/image.yml
+  workflow_dispatch:
+
+concurrency:
+  group: arduino-unoq-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  image:
+    uses: ./.github/workflows/image.yml
+    with:
+      image: arduino-unoq
+      version_arg: UNOQ_CORE_VERSION
+      smoke_test: unoq-smoke-test
+      description: arduino-cli 1.6.0 + arduino:zephyr 0.55.0 + ArduinoGraphics 1.1.5 for the Arduino UNO Q (STM32U585)
