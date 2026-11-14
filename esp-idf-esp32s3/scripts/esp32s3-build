@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# esp32s3-build: build an ESP-IDF project for the ESP32-S3.
+#
+#   esp32s3-build [-o OUT_DIR] PROJECT [idf.py options ...]
+#
+# PROJECT is an ESP-IDF project folder (a CMakeLists.txt with
+# include($ENV{IDF_PATH}/tools/cmake/project.cmake), a main/ component, and
+# optionally sdkconfig.defaults). It is copied to a fresh folder and built
+# there with `idf.py set-target esp32s3 build`, so the project folder is never
+# written to (a build/ or sdkconfig in it is ignored). OUT_DIR gets:
+#   <name>.bin        the whole flash image: bootloader, partition table and
+#                     app merged from offset 0x0; flash this one at 0x0
+#   <name>.app.bin    the app alone
+#   <name>.elf, .map  the app's ELF and link map
+#   flash_args        what idf.py would flash, for esptool.py write_flash
+# Extra arguments go to idf.py before `build` (-D NAME=value, -v, ...).
+#
+# Defaults: OUT_DIR=./build/esp32s3.
+set -euo pipefail
+
+out=""
+while getopts "o:h" opt; do
+  case $opt in
+    o) out=$OPTARG ;;
+    h) sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) exit 2 ;;
+  esac
+done
+shift $((OPTIND - 1))
+[ $# -ge 1 ] || { echo "usage: esp32s3-build [-o OUT_DIR] PROJECT [idf.py options ...]" >&2; exit 2; }
+
+project=$1; shift
+[ -d "$project" ] || { echo "esp32s3-build: no project folder $project" >&2; exit 2; }
+project=$(realpath "$project")
+[ -f "$project/CMakeLists.txt" ] || { echo "esp32s3-build: $project has no CMakeLists.txt" >&2; exit 2; }
+name=$(basename "$project")
+out=$(realpath -m "${out:-build/esp32s3}")
+
+# IDF's own Python first, whatever venv is active (a grader's pytest venv lacks IDF's packages)
+unset VIRTUAL_ENV PYTHONHOME PYTHONPATH
+export PATH="$IDF_PYTHON_ENV_PATH/bin:$IDF_PATH/tools:/opt/esp/toolchain-bin:$PATH"
+export IDF_TARGET=esp32s3
+
+work=$(mktemp -d "/tmp/esp32s3-$name-XXXX")
+trap 'rm -rf "$work"' EXIT
+mkdir -p "$work/$name"
+cp -r "$project/." "$work/$name/"
+rm -rf "$work/$name/build" "$work/$name/sdkconfig" "$work/$name/sdkconfig.old"
+
+cd "$work/$name"
+echo "==> idf.py build $name for esp32s3 (ESP-IDF $(cat "$IDF_PATH/version.txt"))"
+idf.py -B "$work/build" "$@" set-target esp32s3 > "$work/set-target.log" 2>&1 \
+  || { cat "$work/set-target.log"; exit 1; }
+idf.py -B "$work/build" "$@" build
+
+b="$work/build"
+app=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["app"]["file"])' "$b/flasher_args.json")
+elf=${app%.bin}.elf
+mkdir -p "$out"
+rm -f "$out/$name".{bin,app.bin,elf,map} "$out/flash_args"
+( cd "$b" && esptool.py --chip esp32s3 merge_bin -o "$out/$name.bin" @flash_args )
+cp "$b/$app" "$out/$name.app.bin"
+cp "$b/$elf" "$out/$name.elf"
+[ -f "$b/${elf%.elf}.map" ] && cp "$b/${elf%.elf}.map" "$out/$name.map"
+cp "$b/flash_args" "$out/flash_args"
+xtensa-esp32s3-elf-size "$out/$name.elf" | tail -1
+ls -l "$out"
