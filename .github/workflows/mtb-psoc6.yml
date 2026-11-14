@@ -1,0 +1,33 @@
+# The mtb-psoc6 image: mtb-psoc6/ in this repo, published as ghcr.io/<owner>/<repo>/mtb-psoc6.
+name: mtb-psoc6
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - mtb-psoc6/**
+      - .github/workflows/mtb-psoc6.yml
+      - .github/workflows/image.yml
+  pull_request:
+    paths:
+      - mtb-psoc6/**
+      - .github/workflows/mtb-psoc6.yml
+      - .github/workflows/image.yml
+  workflow_dispatch:
+
+concurrency:
+  group: mtb-psoc6-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  image:
+    uses: ./.github/workflows/image.yml
+    with:
+      image: mtb-psoc6
+      version_arg: MTB_PDL_VERSION
+      smoke_test: psoc6-smoke-test
+      description: ModusToolbox PDL 3.19.0 + HAL 2.7.4 + BSP 5.0.1 for the CY8CKIT-062S2-AI (PSoC 62S2) + Arm GNU Toolchain 14.3.Rel1
