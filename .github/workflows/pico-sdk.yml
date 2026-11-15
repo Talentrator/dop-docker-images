@@ -1,0 +1,33 @@
+# The pico-sdk image: pico-sdk/ in this repo, published as ghcr.io/<owner>/<repo>/pico-sdk.
+name: pico-sdk
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - pico-sdk/**
+      - .github/workflows/pico-sdk.yml
+      - .github/workflows/image.yml
+  pull_request:
+    paths:
+      - pico-sdk/**
+      - .github/workflows/pico-sdk.yml
+      - .github/workflows/image.yml
+  workflow_dispatch:
+
+concurrency:
+  group: pico-sdk-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  image:
+    uses: ./.github/workflows/image.yml
+    with:
+      image: pico-sdk
+      version_arg: PICO_SDK_VERSION
+      smoke_test: pico-smoke-test
+      description: Raspberry Pi pico-sdk 2.3.1 + picotool 2.3.1 + Arm GNU Toolchain 14.3.Rel1 for the Raspberry Pi Pico 2 (RP2350), with pico-build

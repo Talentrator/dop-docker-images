@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+# pico-build: build a pico-sdk project for a Raspberry Pi Pico board.
+#
+#   pico-build [-b BOARD] [-o OUT_DIR] [-t BUILD_TYPE] PROJECT [cmake -D options ...]
+#
+# PROJECT is a pico-sdk project folder: a CMakeLists.txt that includes
+# $ENV{PICO_SDK_PATH}/external/pico_sdk_import.cmake before project(), calls
+# pico_sdk_init(), and adds one or more executables. It is copied to a fresh
+# folder and built there with CMake and Ninja, so the project folder is never
+# written to (a build/ in it is ignored). For each executable, OUT_DIR gets:
+#   <target>.uf2       the image to flash (drag-and-drop or picotool load)
+#   <target>.elf, .bin, .hex, .map, .dis
+# BOARD is a pico-sdk board name: pico2 (the default, from $PICO_BOARD),
+# pico2_w, pico, pico_w ... The platform follows from the board.
+# BUILD_TYPE is Release (the default) or Debug.
+#
+# Every build is made with PICO_ENTER_USB_BOOT_ON_EXIT=1: returning from main(),
+# exit() or panic() reboots the chip into its USB bootloader instead of halting,
+# so a board on a bench can always be flashed again.
+#
+# Defaults: OUT_DIR=./build/<board>.
+set -euo pipefail
+
+board=${PICO_BOARD:-pico2}
+out=""
+btype=Release
+while getopts "b:o:t:h" opt; do
+  case $opt in
+    b) board=$OPTARG ;;
+    o) out=$OPTARG ;;
+    t) btype=$OPTARG ;;
+    h) sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) exit 2 ;;
+  esac
+done
+shift $((OPTIND - 1))
+[ $# -ge 1 ] || { echo "usage: pico-build [-b BOARD] [-o OUT_DIR] [-t BUILD_TYPE] PROJECT [cmake -D options ...]" >&2; exit 2; }
+
+project=$1; shift
+[ -d "$project" ] || { echo "pico-build: no project folder $project" >&2; exit 2; }
+project=$(realpath "$project")
+[ -f "$project/CMakeLists.txt" ] || { echo "pico-build: $project has no CMakeLists.txt" >&2; exit 2; }
+[ -f "$PICO_SDK_PATH/src/boards/include/boards/$board.h" ] \
+  || { echo "pico-build: no board '$board' in the pico-sdk (see \$PICO_SDK_PATH/src/boards/include/boards)" >&2; exit 2; }
+name=$(basename "$project")
+out=$(realpath -m "${out:-build/$board}")
+
+# the platform the board belongs to; PICO_PLATFORM from the environment would override the board's own
+unset PICO_PLATFORM VIRTUAL_ENV PYTHONHOME PYTHONPATH
+export CFLAGS="${CFLAGS:-} -DPICO_ENTER_USB_BOOT_ON_EXIT=1"
+export CXXFLAGS="${CXXFLAGS:-} -DPICO_ENTER_USB_BOOT_ON_EXIT=1"
+
+work=$(mktemp -d "/tmp/pico-$name-XXXX")
+trap 'rm -rf "$work"' EXIT
+mkdir -p "$work/$name"
+cp -r "$project/." "$work/$name/"
+rm -rf "$work/$name/build"
+
+echo "==> pico-build $name for $board (pico-sdk $PICO_SDK_VERSION, $btype)"
+cmake -S "$work/$name" -B "$work/build" -G Ninja -DPICO_BOARD="$board" -DCMAKE_BUILD_TYPE="$btype" \
+      -DPICO_SDK_PATH="$PICO_SDK_PATH" "$@" > "$work/configure.log" 2>&1 \
+  || { cat "$work/configure.log"; exit 1; }
+grep -E "PICO_PLATFORM|PICO_BOARD|Build type" "$work/configure.log" || true
+cmake --build "$work/build"
+
+mapfile -t uf2s < <(find "$work/build" -name '*.uf2' -not -path '*/_deps/*' | sort)
+[ ${#uf2s[@]} -gt 0 ] || { echo "pico-build: no .uf2 was made: does the project call pico_add_extra_outputs(<target>)?" >&2; exit 1; }
+mkdir -p "$out"
+for u in "${uf2s[@]}"; do
+  t=$(basename "$u" .uf2); d=$(dirname "$u")
+  rm -f "$out/$t".{uf2,elf,bin,hex,map,dis}
+  for ext in uf2 elf bin hex dis; do [ -f "$d/$t.$ext" ] && cp "$d/$t.$ext" "$out/"; done
+  [ -f "$d/$t.elf.map" ] && cp "$d/$t.elf.map" "$out/$t.map"
+  arm-none-eabi-size "$out/$t.elf" | tail -1
+done
+ls -l "$out"
