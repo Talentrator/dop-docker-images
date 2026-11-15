@@ -1,0 +1,6 @@
+# M5Stack AtomS3R (ESP32-S3-PICO-1-N8R8): applied by atoms3r-build before the project's
+# own sdkconfig.defaults, which wins where the two differ.
+CONFIG_IDF_TARGET="esp32s3"
+CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
+# the console is the USB-C port: the chip's own USB Serial/JTAG (UART0 goes nowhere)
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y

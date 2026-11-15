@@ -14,6 +14,7 @@ published to GHCR as `ghcr.io/talentrator/dop-docker-images/<folder>`.
 | [`stm32cube-h5`](stm32cube-h5) | STM32CubeH5 1.7.0 + Arm GNU Toolchain 14.3.Rel1 + CMake for the NUCLEO-H503RB (STM32H503), with `stm32h5-build` | ~1 GB |
 | [`arduino-unoq`](arduino-unoq) | arduino-cli 1.6.0 + arduino:zephyr 0.55.0 + ArduinoGraphics 1.1.5 for the Arduino UNO Q (STM32U585), with `unoq-build` | ~1.4 GB |
 | [`esp-idf-esp32s3`](esp-idf-esp32s3) | ESP-IDF v5.5.6 + xtensa-esp-elf GCC 14.2 for the ESP32-S3 (Adafruit Feather ESP32-S3 Reverse TFT), with `esp32s3-build` | ~2.0 GB |
+| [`esp-idf-atoms3r`](esp-idf-atoms3r) | `esp-idf-esp32s3` + esp_codec_dev 1.6.2 for the M5Stack AtomS3R on an Atomic Echo Base (ESP32-S3, GC9107 LCD, ES8311 audio), with `atoms3r-build` | ~2.6 GB |
 | [`mtb-psoc6`](mtb-psoc6) | Infineon ModusToolbox libraries (PDL 3.19.0, HAL 2.7.4, BSP 5.0.1, FreeRTOS) + Arm GNU Toolchain 14.3.Rel1 for the CY8CKIT-062S2-AI (PSoC 62S2), with `psoc6-build` | ~0.9 GB |
 | [`pico-sdk`](pico-sdk) | Raspberry Pi pico-sdk 2.3.1 + picotool 2.3.1 + Arm GNU Toolchain 14.3.Rel1 for the Raspberry Pi Pico 2 (RP2350) and the RP2040 Picos, with `pico-build` | ~1.1 GB |
 | [`arduino-nano-matter`](arduino-nano-matter) | arduino-cli 1.6.0 + SiliconLabs:silabs 5.0.0 + GCC 12.2.rel1 for the Arduino Nano Matter (MGM240S, EFR32MG24), with `nano-matter-build` | ~1.5 GB |
