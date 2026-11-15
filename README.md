@@ -16,6 +16,7 @@ published to GHCR as `ghcr.io/talentrator/dop-docker-images/<folder>`.
 | [`esp-idf-esp32s3`](esp-idf-esp32s3) | ESP-IDF v5.5.6 + xtensa-esp-elf GCC 14.2 for the ESP32-S3 (Adafruit Feather ESP32-S3 Reverse TFT), with `esp32s3-build` | ~2.0 GB |
 | [`mtb-psoc6`](mtb-psoc6) | Infineon ModusToolbox libraries (PDL 3.19.0, HAL 2.7.4, BSP 5.0.1, FreeRTOS) + Arm GNU Toolchain 14.3.Rel1 for the CY8CKIT-062S2-AI (PSoC 62S2), with `psoc6-build` | ~0.9 GB |
 | [`pico-sdk`](pico-sdk) | Raspberry Pi pico-sdk 2.3.1 + picotool 2.3.1 + Arm GNU Toolchain 14.3.Rel1 for the Raspberry Pi Pico 2 (RP2350) and the RP2040 Picos, with `pico-build` | ~1.1 GB |
+| [`arduino-nano-matter`](arduino-nano-matter) | arduino-cli 1.6.0 + SiliconLabs:silabs 5.0.0 + GCC 12.2.rel1 for the Arduino Nano Matter (MGM240S, EFR32MG24), with `nano-matter-build` | ~1.5 GB |
 
 For DOP, always use the pinned digest a workflow run prints in its summary, not a tag:
 `ghcr.io/talentrator/dop-docker-images/<image>@sha256:<digest>`.
