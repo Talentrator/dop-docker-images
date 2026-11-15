@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+# atoms3r-build: build an ESP-IDF project for the M5Stack AtomS3R (ESP32-S3).
+#
+#   atoms3r-build [-o OUT_DIR] PROJECT [idf.py options ...]
+#
+# esp32s3-build with the board's sdkconfig defaults (/opt/esp/atoms3r/sdkconfig.board:
+# 8 MB flash, console on the USB-C port's USB Serial/JTAG) put before the project's own
+# sdkconfig.defaults, which wins where they differ. The project folder is never written
+# to (a build/ or sdkconfig in it is ignored). OUT_DIR (default ./build/atoms3r) gets:
+#   <name>.bin        the whole flash image (bootloader, partition table, app) from 0x0;
+#                     this is the one to flash
+#   <name>.app.bin    the app alone
+#   <name>.elf, .map  the app's ELF and link map
+#   flash_args        what idf.py would flash
+# Extra arguments go to idf.py (-D NAME=value, -v, ...).
+set -euo pipefail
+
+out=""
+while getopts "o:h" opt; do
+  case $opt in
+    o) out=$OPTARG ;;
+    h) sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) exit 2 ;;
+  esac
+done
+shift $((OPTIND - 1))
+[ $# -ge 1 ] || { echo "usage: atoms3r-build [-o OUT_DIR] PROJECT [idf.py options ...]" >&2; exit 2; }
+
+project=$1; shift
+[ -d "$project" ] || { echo "atoms3r-build: no project folder $project" >&2; exit 2; }
+project=$(realpath "$project")
+[ -f "$project/CMakeLists.txt" ] || { echo "atoms3r-build: $project has no CMakeLists.txt" >&2; exit 2; }
+name=$(basename "$project")
+out=$(realpath -m "${out:-build/atoms3r}")
+
+work=$(mktemp -d "/tmp/atoms3r-$name-XXXX")
+trap 'rm -rf -- "${work:?}"' EXIT
+mkdir -p "$work/$name"
+cp -r "$project/." "$work/$name/"
+# the board's defaults first, the project's after them (later lines win)
+{
+  cat /opt/esp/atoms3r/sdkconfig.board
+  echo
+  if [ -f "$project/sdkconfig.defaults" ]; then cat "$project/sdkconfig.defaults"; fi
+} > "$work/$name/sdkconfig.defaults"
+
+# esp32s3-build copies it again, drops any build/ and sdkconfig, builds, and writes OUT
+esp32s3-build -o "$out" "$work/$name" "$@"
