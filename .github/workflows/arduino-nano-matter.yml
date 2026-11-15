@@ -1,0 +1,33 @@
+# The arduino-nano-matter image: arduino-nano-matter/ in this repo, published as ghcr.io/<owner>/<repo>/arduino-nano-matter.
+name: arduino-nano-matter
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - arduino-nano-matter/**
+      - .github/workflows/arduino-nano-matter.yml
+      - .github/workflows/image.yml
+  pull_request:
+    paths:
+      - arduino-nano-matter/**
+      - .github/workflows/arduino-nano-matter.yml
+      - .github/workflows/image.yml
+  workflow_dispatch:
+
+concurrency:
+  group: arduino-nano-matter-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  image:
+    uses: ./.github/workflows/image.yml
+    with:
+      image: arduino-nano-matter
+      version_arg: NANO_MATTER_CORE_VERSION
+      smoke_test: nano-matter-smoke-test
+      description: arduino-cli 1.6.0 + SiliconLabs:silabs 5.0.0 (nano_matter) for the Arduino Nano Matter (MGM240S, EFR32MG24)

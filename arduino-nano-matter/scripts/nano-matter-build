@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+# nano-matter-build: compile an Arduino sketch for the Arduino Nano Matter (MGM240S, EFR32MG24).
+#
+#   nano-matter-build [-s STACK] [-o OUT_DIR] SKETCH [arduino-cli compile options ...]
+#
+# SKETCH is a sketch folder (holding <folder name>.ino) or the .ino itself. The sketch is
+# copied to a fresh folder and compiled there with arduino-cli for
+# SiliconLabs:silabs:nano_matter, so the sketch folder is never written to.
+# STACK is the core's "Protocol stack" menu: none (the default), matter, zigbee,
+# ble_arduino or ble_silabs. OUT_DIR gets:
+#   <name>.hex          the whole flash image: the board's Gecko bootloader at 0x08000000
+#                       and the sketch at 0x08006000; flash this one
+#   <name>.sketch.hex   the sketch alone, as the Arduino IDE's upload writes it
+#   <name>.elf, .map    the sketch's ELF and link map
+# Extra arguments go to `arduino-cli compile` (--build-property, -v, ...).
+#
+# Defaults: STACK=none, OUT_DIR=./build/nano_matter.
+set -euo pipefail
+
+fqbn=${NANO_MATTER_FQBN:-SiliconLabs:silabs:nano_matter}
+stack=none
+out=""
+while getopts "s:o:h" opt; do
+  case $opt in
+    s) stack=$OPTARG ;;
+    o) out=$OPTARG ;;
+    h) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) exit 2 ;;
+  esac
+done
+shift $((OPTIND - 1))
+usage="usage: nano-matter-build [-s none|matter|zigbee|ble_arduino|ble_silabs] [-o OUT_DIR] SKETCH [arduino-cli compile options ...]"
+[ $# -ge 1 ] || { echo "$usage" >&2; exit 2; }
+case $stack in
+  none|matter|zigbee|ble_arduino|ble_silabs) ;;
+  *) echo "nano-matter-build: unknown protocol stack '$stack'" >&2; echo "$usage" >&2; exit 2 ;;
+esac
+
+sketch=$1; shift
+[ -f "$sketch" ] && sketch=$(dirname "$sketch")
+[ -d "$sketch" ] || { echo "nano-matter-build: no sketch folder $sketch" >&2; exit 2; }
+sketch=$(realpath "$sketch")
+name=$(basename "$sketch")
+[ -f "$sketch/$name.ino" ] || { echo "nano-matter-build: $sketch has no $name.ino (a sketch's main file is named after its folder)" >&2; exit 2; }
+out=$(realpath -m "${out:-build/nano_matter}")
+
+work=$(mktemp -d "/tmp/nano-matter-$name-XXXX")
+trap 'rm -rf "$work"' EXIT
+mkdir -p "$work/$name"
+cp -r "$sketch/." "$work/$name/"
+rm -rf "$work/$name/build"
+
+echo "==> arduino-cli compile $name for $fqbn:protocol_stack=$stack"
+arduino-cli compile --fqbn "$fqbn:protocol_stack=$stack" --build-path "$work/build" --output-dir "$work/out" \
+  --warnings default "$@" "$work/$name"
+
+full="$work/out/$name.ino.with_bootloader.hex"
+[ -f "$full" ] || { echo "nano-matter-build: the build made no $name.ino.with_bootloader.hex" >&2; ls "$work/out" >&2; exit 1; }
+
+mkdir -p "$out"
+rm -f "$out/$name".{hex,sketch.hex,elf,map}
+cp "$full" "$out/$name.hex"
+cp "$work/out/$name.ino.hex" "$out/$name.sketch.hex"
+for ext in elf map; do
+  [ -f "$work/out/$name.ino.$ext" ] && cp "$work/out/$name.ino.$ext" "$out/$name.$ext"
+done
+echo "==> $out/$name.hex: bootloader + sketch"
+ls -l "$out"
