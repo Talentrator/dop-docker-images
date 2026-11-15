@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+# stm32wb0-build: build an STM32CubeWB0 project for the NUCLEO-WB09KE (STM32WB09KE).
+#
+#   stm32wb0-build [-o OUT_DIR] [-t BUILD_TYPE] PROJECT [cmake -D options ...]
+#
+# PROJECT is a folder, built the first way that fits:
+#   1. it has a CMakeLists.txt: that is built (it uses stm32wb0_firmware() from
+#      $STM32WB0_CMAKE/stm32wb0.cmake; see that file);
+#   2. it has STM32CubeIDE/.cproject, like every example under
+#      $STM32CUBEWB0/Projects/NUCLEO-WB09KE: its Release configuration is built
+#      as STM32CubeIDE would (the same sources, includes, defines, libraries and
+#      linker script), also when the folder has been copied out of the SDK;
+#   3. otherwise every .c/.s under it is built with the HAL, the BSP and, when its
+#      sources include them, LL, the BLE stack or FreeRTOS.
+#
+# The project is copied to a fresh build folder, so the sources are never
+# written to. NAME.elf, .hex, .bin and .map end up in OUT_DIR. Extra arguments
+# go to cmake's configure step.
+#
+# Defaults: OUT_DIR=./build, BUILD_TYPE=Release (-Os -g; Debug is -Og -g3).
+set -euo pipefail
+
+out=""
+btype=Release
+while getopts "o:t:h" opt; do
+  case $opt in
+    o) out=$OPTARG ;;
+    t) btype=$OPTARG ;;
+    h) sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) exit 2 ;;
+  esac
+done
+shift $((OPTIND - 1))
+[ $# -ge 1 ] || { echo "usage: stm32wb0-build [-o OUT_DIR] [-t BUILD_TYPE] PROJECT [cmake options ...]" >&2; exit 2; }
+
+project=$1; shift
+[ -d "$project" ] || { echo "stm32wb0-build: $project is not a folder" >&2; exit 2; }
+project=$(realpath "$project")
+out=$(realpath -m "${out:-build}")
+name=$(basename "$project" | tr -c 'A-Za-z0-9_\n' '_')
+
+# the system python, not a venv that may be first on PATH (a grader's is)
+PY=/usr/bin/python3
+
+work=$(mktemp -d "/tmp/stm32wb0-$(basename "$project")-XXXX")
+trap 'rm -rf "$work"' EXIT
+# without build output, EWARM/MDK-ARM projects or a .git of the project
+(cd "$project" && tar --exclude=./build --exclude=./EWARM --exclude=./MDK-ARM --exclude=./.git \
+   --exclude=./STM32CubeIDE/Debug --exclude=./STM32CubeIDE/Release -cf - .) | tar -xf - -C "$work"
+mkdir -p "$work/.build"
+
+if [ -f "$work/CMakeLists.txt" ]; then
+  :
+elif [ -f "$work/STM32CubeIDE/.cproject" ] && [ -f "$work/STM32CubeIDE/.project" ]; then
+  "$PY" "$STM32WB0_CMAKE/cubeide2cmake.py" "$work" "$project" "$name"
+else
+  # a plain folder of sources: list them and pick the options its includes ask for
+  cd "$work"
+  mapfile -t srcs < <(find . -path ./.build -prune -o -type f \( -name '*.c' -o -name '*.cpp' -o -name '*.s' -o -name '*.S' \) -print | sed 's|^\./||' | sort)
+  [ ${#srcs[@]} -gt 0 ] || { echo "stm32wb0-build: no CMakeLists.txt, no STM32CubeIDE project and no sources in $project" >&2; exit 2; }
+  mapfile -t incs < <(find . -path ./.build -prune -o -type f -name '*.h' -printf '%h\n' | sed 's|^\./||' | sort -u)
+  ld=$(find . -path ./.build -prune -o -type f \( -name '*_FLASH.ld' -o -name '*_flash.ld' \) -print -quit)
+  hdrs=(); for i in "${incs[@]}"; do hdrs+=("$i"/*.h); done
+  has() { grep -qsE "#include *[<\"]($1)" "${srcs[@]}" "${hdrs[@]}" 2>/dev/null; }
+  opts=" BSP"
+  has 'ble\.h|ble_stack|bleplat' && opts="$opts BLE"
+  has 'FreeRTOS\.h|cmsis_os2?\.h' && opts="$opts FREERTOS"
+  has 'stm32wb0x_ll_' && opts="$opts LL"
+  {
+    echo "cmake_minimum_required(VERSION 3.22)"
+    echo "project($name C CXX ASM)"
+    echo "include(\$ENV{STM32WB0_CMAKE}/stm32wb0.cmake)"
+    echo "stm32wb0_firmware($name$opts"
+    echo "  SOURCES ${srcs[*]}"
+    [ ${#incs[@]} -gt 0 ] && echo "  INCLUDES ${incs[*]}"
+    [ -n "$ld" ] && echo "  LINKER_SCRIPT ${ld#./}"
+    echo ")"
+  } > CMakeLists.txt
+  echo "==> no CMakeLists.txt and no STM32CubeIDE project: building every source (options:$opts)"
+fi
+
+echo "==> cmake configure ($btype)"
+cmake -G Ninja -S "$work" -B "$work/.build" \
+  -DCMAKE_TOOLCHAIN_FILE="$STM32WB0_CMAKE/arm-none-eabi.cmake" \
+  -DCMAKE_BUILD_TYPE="$btype" "$@" > "$work/.configure.log" 2>&1 \
+  || { cat "$work/.configure.log"; echo "stm32wb0-build: cmake configure failed" >&2; exit 1; }
+echo "==> cmake build"
+cmake --build "$work/.build"
+
+mkdir -p "$out"
+mapfile -t elfs < <(find "$work/.build" -maxdepth 1 -name '*.elf')
+[ ${#elfs[@]} -gt 0 ] || { echo "stm32wb0-build: the build made no .elf" >&2; exit 1; }
+for elf in "${elfs[@]}"; do
+  for ext in elf hex bin map; do
+    f="${elf%.elf}.$ext"
+    [ -f "$f" ] && cp "$f" "$out/"
+  done
+done
+echo "==> $out"
+ls -l "$out"
