@@ -1,0 +1,291 @@
+#!/usr/bin/python3 -I
+"""psoc6-build: build a ModusToolbox-style application for the CY8CKIT-062S2-AI (PSoC 62, CM4).
+
+    psoc6-build [-o OUT_DIR] [-c Debug|Release] [-v] PROJECT
+
+PROJECT is an application folder, laid out like a ModusToolbox code example:
+C/C++/assembly sources anywhere under it, and optionally a ModusToolbox
+Makefile. From the Makefile it reads APPNAME, CONFIG, COMPONENTS,
+DISABLE_COMPONENTS, DEFINES, SOURCES, INCLUDES, VFP_SELECT, CFLAGS, CXXFLAGS,
+ASFLAGS, LDFLAGS, LDLIBS and LINKER_SCRIPT. TARGET is always CY8CKIT-062S2-AI.
+
+Sources are found the way ModusToolbox's auto-discovery finds them: every
+.c/.cpp/.S/.s file and every folder with headers, skipping COMPONENT_X,
+TOOLCHAIN_X, TARGET_X and CONFIG_X folders whose X is not in the build, and
+whatever a .cyignore lists. The libraries come from the image ($MTB_LIBS):
+the BSP, mtb-pdl-cat1, mtb-hal-cat1, core-lib, cmsis, cat1cm0p (the CM0+
+sleep image) and retarget-io, plus freertos, abstraction-rtos and
+clib-support when COMPONENTS has FREERTOS. A project's deps/ and libs/
+folders (.mtb files) are ignored: every library is already here.
+
+The project is copied to a fresh folder and built there with Ninja, so the
+sources are never written to. APPNAME.elf, .hex, .bin and .map land in
+OUT_DIR (default ./build). Defaults: CONFIG from the Makefile, else Debug.
+"""
+import argparse
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+
+MTB = os.environ.get("MTB_DIR", "/opt/mtb")
+LIBS = os.environ.get("MTB_LIBS", MTB + "/libs")
+GCC = os.environ.get("ARM_GCC_DIR", MTB + "/gcc")
+TOOLS = os.environ.get("CY_TOOLS_DIR_IMAGE", MTB + "/tools_3.0")
+
+TARGET = "CY8CKIT-062S2-AI"
+DEVICE = "CY8C624ABZI-S2D44"
+DEVICE_COMPONENTS = "43439 CAT1 CAT1A HCI-UART MURATA-1YN PSOC6_02".split()
+BSP_COMPONENTS = "CM0P_SLEEP WIFI_INTERFACE_SDIO".split()
+BSP_DEFINES = ["CY_USING_HAL"]
+CORE, CORE_NAME = "CM4", "CM4_0"
+
+BASE_LIBS = ["TARGET_" + TARGET, "mtb-pdl-cat1", "mtb-hal-cat1", "core-lib", "cmsis", "cat1cm0p", "retarget-io"]
+RTOS_LIBS = ["freertos", "abstraction-rtos", "clib-support"]
+
+SRC_EXT = {".c": "cc", ".cpp": "cxx", ".cc": "cxx", ".cxx": "cxx", ".S": "as", ".s": "as"}
+HDR_EXT = {".h", ".hpp", ".hh", ".hxx", ".inc"}
+FILTER_PREFIXES = ("COMPONENT_", "TOOLCHAIN_", "TARGET_", "CONFIG_")
+SKIP_TOP = {"build", "deps", "libs", "bsps", "mtb_shared", "images", "templates"}
+MAKE_VARS = ["APPNAME", "CONFIG", "TARGET", "CORE", "COMPONENTS", "DISABLE_COMPONENTS", "DEFINES",
+             "SOURCES", "INCLUDES", "VFP_SELECT", "CFLAGS", "CXXFLAGS", "ASFLAGS", "LDFLAGS",
+             "LDLIBS", "LINKER_SCRIPT"]
+
+
+def die(msg, code=1):
+    print("psoc6-build: " + msg, file=sys.stderr)
+    sys.exit(code)
+
+
+def makefile_vars(project):
+    """Evaluate the project's Makefile with the image's stub start.mk and read its variables."""
+    if not os.path.isfile(os.path.join(project, "Makefile")):
+        return {}
+    env = dict(os.environ, CY_TOOLS_PATHS=TOOLS, MTB_PRINT_ONLY="1")
+    r = subprocess.run(["make", "-s", "--no-print-directory", "-f", "Makefile",
+                        "-f", os.path.join(TOOLS, "make", "print.mk"), "__mtb_print"],
+                       cwd=project, env=env, capture_output=True, text=True)
+    if r.returncode != 0:
+        die("could not read the Makefile:\n" + r.stdout + r.stderr)
+    out = {}
+    for line in r.stdout.splitlines():
+        if line.startswith("__MTB_VAR "):
+            k, _, v = line[len("__MTB_VAR "):].partition("=")
+            out[k] = v.strip()
+    return out
+
+
+def read_cyignore(d):
+    p = os.path.join(d, ".cyignore")
+    ign = set()
+    if os.path.isfile(p):
+        with open(p, errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "$(" in line:
+                    continue
+                ign.add(os.path.normpath(os.path.join(d, line)))
+    return ign
+
+
+def discover(root, comps, top_skip=frozenset()):
+    """ModusToolbox auto-discovery under root: (sources, include dirs, archives)."""
+    srcs, incs, libs = [], [], []
+    ignored = set()
+
+    def walk(d, top):
+        ignored.update(read_cyignore(d))
+        try:
+            entries = sorted(os.scandir(d), key=lambda e: e.name)
+        except OSError:
+            return
+        has_hdr = False
+        for e in entries:
+            path = os.path.normpath(e.path)
+            if path in ignored or e.name.startswith("."):
+                continue
+            if e.is_dir(follow_symlinks=True):
+                if top and e.name in top_skip:
+                    continue
+                if e.name.startswith(FILTER_PREFIXES):
+                    if e.name.split("_", 1)[1] not in comps:
+                        continue
+                walk(path, False)
+            else:
+                ext = os.path.splitext(e.name)[1]
+                if ext in SRC_EXT:
+                    srcs.append(path)
+                elif ext in HDR_EXT:
+                    has_hdr = True
+                elif ext == ".a":
+                    libs.append(path)
+        if has_hdr:
+            incs.append(d)
+
+    root = os.path.normpath(root)
+    walk(root, True)
+    # like ModusToolbox, also every folder between the root and a header folder
+    # (e.g. include/ for #include "pin_packages/x.h")
+    all_incs, seen = [], set()
+    for d in incs:
+        chain = []
+        while d not in seen and (d == root or d.startswith(root + os.sep)):
+            seen.add(d)
+            chain.append(d)
+            if d == root:
+                break
+            d = os.path.dirname(d)
+        all_incs += reversed(chain)
+    return srcs, all_incs, libs
+
+
+def ninja_escape(s):
+    return s.replace("$", "$$").replace(" ", "$ ").replace(":", "$:")
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="psoc6-build", add_help=False)
+    ap.add_argument("-o", dest="out", default="build")
+    ap.add_argument("-c", dest="config")
+    ap.add_argument("-v", dest="verbose", action="store_true")
+    ap.add_argument("-h", "--help", action="store_true")
+    ap.add_argument("project", nargs="?")
+    a = ap.parse_args()
+    if a.help:
+        print(__doc__.strip())
+        return 0
+    if not a.project:
+        die("usage: psoc6-build [-o OUT_DIR] [-c Debug|Release] [-v] PROJECT", 2)
+    project = os.path.realpath(a.project)
+    if not os.path.isdir(project):
+        die(a.project + " is not a folder", 2)
+    out = os.path.realpath(a.out)
+
+    work = tempfile.mkdtemp(prefix="psoc6-%s-" % os.path.basename(project))
+    try:
+        app = os.path.join(work, "app")
+        shutil.copytree(project, app, symlinks=True,
+                        ignore=lambda d, names: [n for n in names if d == project and n in ("build", ".git")])
+        mv = makefile_vars(app)
+
+        if mv.get("TARGET") and mv["TARGET"] not in (TARGET, "APP_" + TARGET):
+            print("==> Makefile TARGET=%s; building for %s" % (mv["TARGET"], TARGET))
+        if mv.get("CORE") and mv["CORE"] != CORE:
+            die("CORE=%s: only the CM4 application is supported (the CM0+ runs the prebuilt sleep image)" % mv["CORE"])
+        appname = mv.get("APPNAME") or os.path.basename(project)
+        appname = re.sub(r"[^A-Za-z0-9_.-]", "_", appname)
+        config = a.config or mv.get("CONFIG") or "Debug"
+        if config not in ("Debug", "Release", "Custom"):
+            die("CONFIG must be Debug, Release or Custom, not " + config, 2)
+        vfp = mv.get("VFP_SELECT") or "softfp"
+        vfp_comp = {"softfp": "SOFTFP", "hardfp": "HARDFP", "softfloat": "SOFTFLOAT"}.get(vfp)
+        if not vfp_comp:
+            die("VFP_SELECT must be softfp, hardfp or softfloat", 2)
+
+        user_comps = mv.get("COMPONENTS", "").split()
+        disabled = set(mv.get("DISABLE_COMPONENTS", "").split())
+        comps = [CORE, CORE_NAME, vfp_comp, "GCC_ARM", TARGET, config] + user_comps + DEVICE_COMPONENTS + BSP_COMPONENTS
+        comps = sorted(set(c for c in comps if c not in disabled))
+        cset = set(comps)
+
+        libnames = BASE_LIBS + (RTOS_LIBS if "FREERTOS" in cset else [])
+        srcs, incs, archives = discover(app, cset, SKIP_TOP)
+        for extra in mv.get("SOURCES", "").split():
+            p = os.path.normpath(os.path.join(app, extra))
+            if p not in srcs:
+                srcs.append(p)
+        user_incs = [os.path.normpath(os.path.join(app, i)) for i in mv.get("INCLUDES", "").split()]
+        for lib in libnames:
+            s, i, l = discover(os.path.join(LIBS, lib), cset)
+            srcs += s
+            incs += i
+            archives += l
+        if not any(s.startswith(app + os.sep) for s in srcs):
+            die("no sources in " + project)
+
+        ld = mv.get("LINKER_SCRIPT")
+        ld = os.path.join(app, ld) if ld else os.path.join(LIBS, "TARGET_" + TARGET, "COMPONENT_CM4", "TOOLCHAIN_GCC_ARM", "linker.ld")
+
+        cpu = ["-mcpu=cortex-m4", "--specs=nano.specs"]
+        cpu += {"softfp": ["-mfloat-abi=softfp", "-mfpu=fpv4-sp-d16"],
+                "hardfp": ["-mfloat-abi=hard", "-mfpu=fpv4-sp-d16"], "softfloat": []}[vfp]
+        common = ["-mthumb", "-ffunction-sections", "-fdata-sections", "-ffat-lto-objects", "-g", "-Wall", "-pipe"]
+        opt = {"Debug": ["-Og", "-DDEBUG"], "Release": ["-Os", "-DNDEBUG"], "Custom": []}[config]
+        t = TARGET.replace("-", "_")
+        defs = ["TARGET_" + t, "CY_TARGET_BOARD=" + t, "CY_SUPPORTS_DEVICE_VALIDATION",
+                "CORE_NAME_%s=1" % CORE_NAME, DEVICE.replace("-", "_"), "CY_APPNAME_" + appname.replace("-", "_").replace(".", "_")]
+        defs += ["COMPONENT_" + c.replace("-", "_").replace(".", "_") for c in comps]
+        defs += BSP_DEFINES + mv.get("DEFINES", "").split()
+        dflags = ["-D" + d for d in sorted(set(defs))]
+        seen, inc_list = set(), []
+        for i in user_incs + [app] + incs:
+            if i not in seen:
+                seen.add(i)
+                inc_list.append(i)
+        iflags = ["-I" + i for i in inc_list]
+
+        cflags = ["-c"] + cpu + opt + common + shlex.split(mv.get("CFLAGS", ""))
+        cxxflags = ["-c"] + cpu + opt + common + ["-fno-rtti", "-fno-exceptions"] + shlex.split(mv.get("CXXFLAGS", ""))
+        asflags = ["-c"] + cpu + common + ["-x", "assembler-with-cpp"] + shlex.split(mv.get("ASFLAGS", ""))
+        ldflags = cpu + common + ["-Wl,--gc-sections"] + shlex.split(mv.get("LDFLAGS", ""))
+
+        bdir = os.path.join(work, "obj")
+        os.makedirs(bdir)
+        with open(os.path.join(work, "flags.rsp"), "w") as f:
+            f.write("\n".join(shlex.quote(x) for x in dflags + iflags) + "\n")
+        q = lambda xs: " ".join(shlex.quote(x) for x in xs)
+        cc, cxx = GCC + "/bin/arm-none-eabi-gcc", GCC + "/bin/arm-none-eabi-g++"
+        rsp = "@" + os.path.join(work, "flags.rsp")
+        lines = [
+            "rule cc\n  command = %s %s %s -MMD -MP -MF $out.d -o $out $in\n  depfile = $out.d\n  deps = gcc\n  description = CC $in" % (cc, q(cflags), rsp),
+            "rule cxx\n  command = %s %s %s -MMD -MP -MF $out.d -o $out $in\n  depfile = $out.d\n  deps = gcc\n  description = CXX $in" % (cxx, q(cxxflags), rsp),
+            "rule as\n  command = %s %s %s -MMD -MP -MF $out.d -o $out $in\n  depfile = $out.d\n  deps = gcc\n  description = AS $in" % (cc, q(asflags), rsp),
+            "rule link\n  command = %s %s -T %s -Wl,-Map,$map -o $out @$out.rsp\n  rspfile = $out.rsp\n  rspfile_content = -Wl,--start-group $in $libs -Wl,--end-group\n  description = LINK $out" % (cxx, q(ldflags), shlex.quote(ld)),
+            "rule hex\n  command = %s/bin/arm-none-eabi-objcopy -O ihex $in $out\n  description = HEX $out" % GCC,
+            "rule bin\n  command = %s/bin/arm-none-eabi-objcopy -O binary -R .cy_em_eeprom -R .cy_sflash_user_data -R .cy_sflash_nar -R .cy_sflash_public_key -R .cy_toc_part2 -R .cy_rtoc_part2 -R .cy_efuse -R .cymeta -R .cy_app_signature $in $out\n  description = BIN $out" % GCC,
+        ]
+        objs, names = [], {}
+        for s in srcs:
+            rel = os.path.relpath(s, work if s.startswith(work) else LIBS)
+            o = os.path.join(bdir, re.sub(r"[^A-Za-z0-9_.-]", "_", rel) + ".o")
+            if o in names:
+                die("two sources map to one object: %s and %s" % (names[o], s))
+            names[o] = s
+            objs.append(o)
+            lines.append("build %s: %s %s" % (ninja_escape(o), SRC_EXT[os.path.splitext(s)[1]], ninja_escape(s)))
+        elf = os.path.join(work, appname + ".elf")
+        libs_flags = q(archives + shlex.split(mv.get("LDLIBS", "")))
+        lines.append("build %s: link %s | %s\n  map = %s\n  libs = %s" % (
+            ninja_escape(elf), " ".join(ninja_escape(o) for o in objs), ninja_escape(ld),
+            ninja_escape(elf[:-4] + ".map"), libs_flags.replace("$", "$$")))
+        lines.append("build %s: hex %s" % (ninja_escape(elf[:-4] + ".hex"), ninja_escape(elf)))
+        lines.append("build %s: bin %s" % (ninja_escape(elf[:-4] + ".bin"), ninja_escape(elf)))
+        with open(os.path.join(work, "build.ninja"), "w") as f:
+            f.write("\n".join(lines) + "\n")
+
+        nsrc = sum(1 for s in srcs if s.startswith(app + os.sep))
+        print("==> %s for %s (%s, %s): %d project sources, %d library sources; components: %s"
+              % (appname, TARGET, config, vfp, nsrc, len(srcs) - nsrc, " ".join(comps)))
+        cmd = ["ninja", "-C", work] + (["-v"] if a.verbose else [])
+        if subprocess.run(cmd).returncode != 0:
+            die("build failed")
+        os.makedirs(out, exist_ok=True)
+        for ext in ("elf", "hex", "bin", "map"):
+            shutil.copy(elf[:-4] + "." + ext, out)
+        subprocess.run([GCC + "/bin/arm-none-eabi-size", elf])
+        print("==> " + out)
+        for ext in ("elf", "hex", "bin", "map"):
+            print("    %s.%s" % (appname, ext))
+    finally:
+        if os.environ.get("PSOC6_KEEP_WORK"):
+            print("==> kept " + work)
+        else:
+            shutil.rmtree(work, ignore_errors=True)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
