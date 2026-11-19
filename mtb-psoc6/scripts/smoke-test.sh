@@ -24,6 +24,13 @@ try() {   # try NAME PROJECT
 }
 
 try blinky          /opt/mtb/templates/blinky
+# the BSP's clock and pin setup must be linked in (cybsp_init -> cycfg_config_init -> init_cycfg_system)
+echo "==== BSP configuration linked"
+if arm-none-eabi-nm "$work/out-blinky/blinky.elf" 2>/dev/null | grep -q ' init_cycfg_system$'; then
+  pass+=(bsp_config)
+else
+  fail+=(bsp_config); echo "init_cycfg_system is not in blinky.elf: cybsp_init() would skip the BSP clock setup"
+fi
 try blinky_freertos /opt/mtb/templates/blinky_freertos
 for ex in /opt/mtb/examples/*/; do
   try "$(basename "$ex")" "$ex"
