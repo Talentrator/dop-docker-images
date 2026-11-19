@@ -188,10 +188,15 @@ def main():
         user_comps = mv.get("COMPONENTS", "").split()
         disabled = set(mv.get("DISABLE_COMPONENTS", "").split())
         comps = [CORE, CORE_NAME, vfp_comp, "GCC_ARM", TARGET, config] + user_comps + DEVICE_COMPONENTS + BSP_COMPONENTS
+        libnames = BASE_LIBS + (RTOS_LIBS if "FREERTOS" in comps and "FREERTOS" not in disabled else [])
+        # ModusToolbox's make adds MW_<LIBRARY> to COMPONENTS for every library of the build. The
+        # BSP relies on it: cybsp.c includes mtb_cat1cm0p.h only under COMPONENT_MW_CAT1CM0P, and
+        # without CY_USING_PREBUILT_CM0P_IMAGE from there cybsp_init() skips cycfg_config_init(),
+        # so the board would run on the reset clocks (8 MHz IMO, CLK_LF on the ILO).
+        comps += ["MW_" + re.sub(r"[^A-Za-z0-9]", "_", lib).upper() for lib in libnames if not lib.startswith("TARGET_")]
         comps = sorted(set(c for c in comps if c not in disabled))
         cset = set(comps)
 
-        libnames = BASE_LIBS + (RTOS_LIBS if "FREERTOS" in cset else [])
         srcs, incs, archives = discover(app, cset, SKIP_TOP)
         for extra in mv.get("SOURCES", "").split():
             p = os.path.normpath(os.path.join(app, extra))
